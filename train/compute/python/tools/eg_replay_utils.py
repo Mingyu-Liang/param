@@ -3,13 +3,24 @@ import re
 import torch
 from fbgemm_gpu.split_table_batched_embeddings_ops import PoolingMode, WeightDecayMode
 
-from param_bench.train.compute.python.lib.pytorch.config_util import create_op_args
-from param_bench.train.compute.python.tools.execution_graph import NodeType
+import sys
+sys.path.append('/home/ml2585/research/param/train/compute/python')
 
-from param_bench.train.compute.python.workloads.pytorch.split_table_batched_embeddings_ops import (
+from lib.pytorch.config_util import create_op_args
+from tools.execution_graph import NodeType
+
+from workloads.pytorch.split_table_batched_embeddings_ops import (
     SplitTableBatchedEmbeddingBagsCodegenInputDataGenerator,
     SplitTableBatchedEmbeddingBagsCodegenOp,
 )
+
+# from param_bench.train.compute.python.lib.pytorch.config_util import create_op_args
+# from param_bench.train.compute.python.tools.execution_graph import NodeType
+
+# from param_bench.train.compute.python.workloads.pytorch.split_table_batched_embeddings_ops import (
+#     SplitTableBatchedEmbeddingBagsCodegenInputDataGenerator,
+#     SplitTableBatchedEmbeddingBagsCodegenOp,
+# )
 
 
 # TODO: Add all torch dtypes to here
@@ -454,7 +465,10 @@ from datetime import datetime
 import comms_utils
 
 import torch
-from param_bench.train.comms.pt import commsTraceReplay
+
+import commsTraceReplay
+
+# from param_bench.train.comms.pt import commsTraceReplay
 from param_bench.train.compute.python.tools.eg_replay_utils import (
     build_fbgemm_func,
     build_torchscript_func,

@@ -8,10 +8,10 @@ from collections import defaultdict
 from datetime import datetime
 from functools import reduce
 
-import comms_utils
+# import comms_utils
 import numpy as np
 import torch
-from param_bench.train.comms.pt import commsTraceReplay
+# from param_bench.train.comms.pt import commsTraceReplay
 
 from param_bench.train.compute.python.lib import pytorch as lib_pytorch
 from param_bench.train.compute.python.lib.init_helper import load_modules
@@ -46,6 +46,12 @@ from param_bench.train.compute.python.tools.execution_graph import (
 from param_bench.train.compute.python.tools.utility import trace_handler
 from param_bench.train.compute.python.workloads import pytorch as workloads_pytorch
 from torch.profiler import ExecutionGraphObserver
+
+import sys
+sys.path.append('/home/ml2585/research/param/train/comms/pt')
+
+import comms_utils
+import commsTraceReplay
 
 
 class ExgrReplayManager:
@@ -1313,7 +1319,7 @@ class ExgrReplayManager:
             return
         print("Start to execution: ")
         time.sleep(2)
-
+        
         total_time = 0.0
         event_1 = torch.cuda.Event(enable_timing=True)
         event_2 = torch.cuda.Event(enable_timing=True)
@@ -1368,6 +1374,7 @@ class ExgrReplayManager:
                     event_1.record()
                     for node in self.sorted_nodes:
                         self.run_op(node, iter)
+                        # torch.cuda.synchronize(self.device)
                     print("Finished one iteration.")
                     event_2.record()
                     torch.cuda.synchronize(self.device)

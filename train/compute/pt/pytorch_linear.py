@@ -9,6 +9,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from torch.profiler import ExecutionGraphObserver, ProfilerActivity
 
 class Net(nn.Module):
     def __init__(self, layers_size):
@@ -66,6 +67,10 @@ def convert_to_datatype(input_obj, data_type):
     return input_obj
 
 
+def profiler_trace_handler(p):
+    p.export_chrome_trace("/zhang-x3/users/ml2585/eg_logs/linear_trace.json")
+
+
 def train_gpu_with_explicit_cast(
     model, device, optimizer, data_type, input_size, output_size, batch_size, args
 ):
@@ -77,28 +82,47 @@ def train_gpu_with_explicit_cast(
     start_event = torch.cuda.Event(enable_timing=True)
     end_event = torch.cuda.Event(enable_timing=True)
     total_time = 0.0
-    for i in range(args.steps + args.warmups):
-        data = torch.randn(batch_size, input_size, device=device)
-        target = torch.randint(
-            output_size, [batch_size], device=device, dtype=torch.long
-        )
-        data = convert_to_datatype(data, data_type)
-        if i >= args.warmups:
-            start_event.record()
-        output = model(data)
-        loss = None
-        if not args.fw_only:
-            optimizer.zero_grad(set_to_none=args.set_to_none)
-            loss = loss_f(output, target)
-            loss.backward()
-            if args.optimizer:
-                optimizer.step()
-        if i >= args.warmups:
-            end_event.record()
-            torch.cuda.synchronize()
-            total_time += start_event.elapsed_time(end_event) * 1.0e-3
 
-    return total_time, loss
+    eg_file = "/zhang-x3/users/ml2585/eg_logs/linear_eg.json"
+    eg = ExecutionGraphObserver()
+    eg.register_callback(eg_file)
+
+    data = torch.randn(batch_size, input_size, device=device)
+    target = torch.randint(
+        output_size, [batch_size], device=device, dtype=torch.long
+    )
+    data = convert_to_datatype(data, data_type)
+
+    with torch.profiler.profile(
+        activities=[ProfilerActivity.CPU,
+                    ProfilerActivity.CUDA],
+        on_trace_ready=profiler_trace_handler,
+    ) as pf:
+        for i in range(args.steps + args.warmups):
+            if i == args.warmups:
+                eg.start()
+            if i == args.warmups + 1:
+                eg.stop()
+                eg.unregister_callback()
+    
+            # if i >= args.warmups:
+            #     start_event.record()
+            output = model(data)
+            loss = None
+            if not args.fw_only:
+                optimizer.zero_grad(set_to_none=args.set_to_none)
+                loss = loss_f(output, target)
+                loss.backward()
+                if args.optimizer:
+                    optimizer.step()
+            # if i >= args.warmups:
+            #     end_event.record()
+            #     torch.cuda.synchronize()
+            #     total_time += start_event.elapsed_time(end_event) * 1.0e-3
+            pf.step()
+
+    return 1, loss
+    # return total_time, loss
 
 
 def train_gpu_with_autocast(
@@ -127,7 +151,7 @@ def train_gpu_with_autocast(
         if i >= args.warmups:
             start_event.record()
         loss = None
-        if not args.fw_only:
+        if not args.fw_only:s
             optimizer.zero_grad(set_to_none=args.set_to_none)
         with autocast(dtype=dt):
             output = model(data)
