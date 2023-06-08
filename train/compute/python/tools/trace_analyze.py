@@ -1,4 +1,7 @@
 import json
+import matplotlib.pyplot as plt
+import statistics
+
 
 def read_dictionary_from_json(file_path):
     with open(file_path, 'r') as file:
@@ -38,6 +41,39 @@ def analyze_cpu_ops_duration(trace_events):
     print('top 10 cpu ops duration fraction: ', sum([cpu_op[1] for cpu_op in top10_cpu_ops])/cpu_ops_duration_total)
     top20_cpu_ops = sorted_cpu_ops_durations[:20]
     print('top 20 cpu ops duration fraction: ', sum([cpu_op[1] for cpu_op in top20_cpu_ops])/cpu_ops_duration_total)
+
+
+def analyze_cpu_ops_duration_under_specific_iteration(trace_events, iteration_name):
+    iteration = [event for event in trace_events if 'name' in event and event['name'] == iteration_name]
+    assert(len(iteration) == 1)
+    sorted_trace_events = sorted(trace_events, key=lambda kv: kv['ts'])
+    selected_trace_events = [event for event in sorted_trace_events if event['ts'] > iteration[0]['ts'] and event['ts'] < iteration[0]['ts'] + iteration[0]['dur']]
+    
+    cpu_events = [event for event in selected_trace_events if 'cat' in event and event['cat'] == 'cpu_op']
+    cpu_ops = {}
+
+    for event in cpu_events:
+        if event['name'] not in cpu_ops:
+            cpu_ops[event['name']] = {}
+            cpu_ops[event['name']]['duration'] = []
+            cpu_ops[event['name']]['duration'].append(event['dur'])
+        else:
+            cpu_ops[event['name']]['duration'].append(event['dur'])    
+
+    cpu_ops_durations = {}
+    for cpu_op in cpu_ops:
+        cpu_ops_durations[cpu_op] = sum(cpu_ops[cpu_op]['duration'])
+
+    cpu_ops_duration_total = sum(cpu_ops_durations.values())
+    sorted_cpu_ops_durations = sorted(cpu_ops_durations.items(), key=lambda kv: kv[1], reverse=True)
+
+    # for cpu_op in sorted_cpu_ops_durations:
+    #     print(cpu_op, ' fraction: ', cpu_op[1]/cpu_ops_duration_total)
+
+    top10_cpu_ops = sorted_cpu_ops_durations[:10]
+    print(f'top 10 cpu ops duration fraction under {iteration_name}: ', sum([cpu_op[1] for cpu_op in top10_cpu_ops])/cpu_ops_duration_total)
+    top20_cpu_ops = sorted_cpu_ops_durations[:20]
+    print(f'top 20 cpu ops duration fraction under {iteration_name}: ', sum([cpu_op[1] for cpu_op in top20_cpu_ops])/cpu_ops_duration_total)
 
 
 def analyze_top_cpu_ops_under_specific_iteration(trace_events, iteration_name):
@@ -118,7 +154,62 @@ trace_events = dictionary['traceEvents']
 
 # analyze_cpu_ops_duration(trace_events)
 
+# analyze_cpu_ops_duration_under_specific_iteration(trace_events, 'iteration#17')
+
 # analyze_top_cpu_ops_under_specific_iteration(trace_events, 'iteration#17')
 
-analyze_kernels_duration(trace_events)
+# analyze_kernels_duration(trace_events)
 
+iteration = [event for event in trace_events if 'name' in event and event['name'] == 'iteration#17']
+assert(len(iteration) == 1)
+sorted_trace_events = sorted(trace_events, key=lambda kv: kv['ts'])
+
+trace_events_under_iteration = [event for event in sorted_trace_events if event['ts'] > iteration[0]['ts'] and event['ts'] < iteration[0]['ts'] + iteration[0]['dur']]
+
+print(len(trace_events_under_iteration))
+
+cuda_runtime = [event for event in trace_events_under_iteration if event['cat'] == 'cuda_runtime']
+# kernels = [event for event in trace_events_under_iteration if event['cat'] == 'kernel']
+kernels = [event for event in trace_events_under_iteration if event['cat'] == 'kernel' or event['cat'] == 'gpu_memset' or event['cat'] == 'gpu_memcpy']
+
+print(len(cuda_runtime), len(kernels))
+
+external_id_cuda_kernel = {}
+
+for cuda in cuda_runtime:
+    if 'args' in cuda and 'External id' in cuda['args']:
+        external_id = cuda['args']['External id']
+        if external_id not in external_id_cuda_kernel:
+            external_id_cuda_kernel[external_id] = {}
+            external_id_cuda_kernel[external_id]['cuda'] = cuda['ts']
+        else:
+            external_id_cuda_kernel[external_id]['cuda'] = cuda['ts']
+
+for kernel in kernels:
+    if 'args' in kernel and 'External id' in kernel['args']:
+        external_id = kernel['args']['External id']
+        if external_id not in external_id_cuda_kernel:
+            external_id_cuda_kernel[external_id] = {}
+            external_id_cuda_kernel[external_id]['kernel'] = kernel['ts']
+        else:
+            external_id_cuda_kernel[external_id]['kernel'] = kernel['ts']
+
+delays_ms = []
+for external_id in external_id_cuda_kernel:
+    if len(external_id_cuda_kernel[external_id]) != 2:
+        print(external_id, external_id_cuda_kernel[external_id])
+    else:
+        delays_ms.append((external_id_cuda_kernel[external_id]['kernel'] - external_id_cuda_kernel[external_id]['cuda']) / 1000)
+
+print('mean: ', statistics.mean(delays_ms), 'std: ', statistics.stdev(delays_ms))
+
+# Create a histogram plot
+plt.hist(delays_ms, bins=10, edgecolor='black')
+
+# Set the plot labels and title
+plt.xlabel('Delay')
+plt.ylabel('Frequency')
+plt.title('Distribution of Delays')
+
+# Save the plot to a file
+plt.savefig('delays_histogram.png')
