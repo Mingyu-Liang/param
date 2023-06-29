@@ -10,6 +10,8 @@ import torchvision.datasets as datasets
 import torch.utils.data.distributed
 from torch.profiler import ExecutionGraphObserver, ProfilerActivity, record_function
 
+# print("PyTorch version: ", torch.__version__)
+
 rank_id = 0
 
 def profiler_trace_handler(p):
@@ -20,8 +22,18 @@ def train(rank, world_size, warmups, steps, eg, profile):
     os.environ['MASTER_ADDR'] = 'localhost'
     os.environ['MASTER_PORT'] = '12355'
 
-    # Initialize the process group
-    dist.init_process_group(backend='nccl', world_size=world_size, rank=rank)
+    if eg:
+        eg_file = f'/zhang-x3/users/ml2585/eg_logs/resnet_dist_eg_{rank}.json'
+        eg = ExecutionGraphObserver()
+        eg.register_callback(eg_file)
+
+        eg.start()
+        # Initialize the process group
+        dist.init_process_group(backend='nccl', world_size=world_size, rank=rank)
+        eg.stop()
+    else:
+        # Initialize the process group
+        dist.init_process_group(backend='nccl', world_size=world_size, rank=rank)
 
     # Set up the ResNet-18 model
     model = models.resnet18()
@@ -55,11 +67,6 @@ def train(rank, world_size, warmups, steps, eg, profile):
     train_sampler = torch.utils.data.distributed.DistributedSampler(train_dataset)
     train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=16,
                                                shuffle=False, num_workers=4, sampler=train_sampler)
-
-    if eg:
-        eg_file = f'/zhang-x3/users/ml2585/eg_logs/resnet_dist_eg_{rank}.json'
-        eg = ExecutionGraphObserver()
-        eg.register_callback(eg_file)
 
     if profile:
         with torch.profiler.profile(

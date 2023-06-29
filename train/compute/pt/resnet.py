@@ -35,7 +35,7 @@ model = torchvision.models.resnet18(pretrained=False)
 torch.set_num_interop_threads(10)
 
 def profiler_trace_handler(p):
-    p.export_chrome_trace("/zhang-x3/users/ml2585/eg_logs/resnet_trace_new_multi.json")
+    p.export_chrome_trace("/zhang-x3/users/ml2585/eg_logs/resnet_trace_iters.json")
 
 def train(warmups, steps, profile, eg, cuda):
     # Use GPU if available
@@ -47,7 +47,7 @@ def train(warmups, steps, profile, eg, cuda):
     optimizer = torch.optim.SGD(model.parameters(), lr=0.1, momentum=0.9, weight_decay=1e-4)
 
     if eg:
-        eg_file = "/zhang-x3/users/ml2585/eg_logs/resnet_eg_new_multi.json"
+        eg_file = f"/zhang-x3/users/ml2585/eg_logs/resnet_eg_iter{warmups}.json"
         eg = ExecutionGraphObserver()
         eg.register_callback(eg_file)
     
