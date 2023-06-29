@@ -510,23 +510,37 @@ class commsArgs:
     This class contains all of the args that we can use to perform a single collective.
 
     Public Attributes:
-        comms: Name of collective.
-        compute: Name of compute kernel.
-        mm_dim: dimension of matrix for replaying GEMM kernels
-        seqnum: Current number of collectives.
-        req: Request ID of collective to map to wait operation.
-        inMsgSize: Size of input tensor.
-        outMsgSize: Size of output tensor.
-        dtype: Data type of tensor values.
-        inSplit: List of input split sizes for rank across current process group.
-        outSplit: List of output split sizes for ranks across current process group.
-        startTimeNs: Start time of current collective.
-        pgId: Unique indentifier for the process group this collective will use.
-        groupRanks: Global ranks of the process group, this is used with PG init.
-        worldSize: World size of current process group.
-        markerStack: Current markers that this collective is a part of.
-        root: Used to determine if collective is src or dst.
-        eg_id: Node id in captured execution graph.
+        Global/Comm Attributes:
+            comms: Name of collective.
+            compute: Name of compute kernel.
+            id: Current trace object ID.
+            req: Request ID of collective to map to wait operation.
+            inMsgSize: Size of input tensor.
+            outMsgSize: Size of output tensor.
+            dtype: Data type of tensor values.
+            inSplit: List of input split sizes for rank across current process group.
+            outSplit: List of output split sizes for ranks across current process group.
+            startTimeNs: Start time of current collective.
+            pgId: Unique indentifier for the process group this collective will use.
+            groupRanks: Global ranks of the process group, this is used with PG init.
+            worldSize: World size of current process group.
+            markerStack: Current markers that this collective is a part of.
+            root: Used to determine if collective is src or dst.
+
+        GEMM Attributes:
+            mm0_dim0: dimension 0 of the first matrix for replaying GEMM kernels
+            mm0_dim1: dimension 1 of the first matrix for replaying GEMM kernels
+            mm1_dim0: dimension 0 of the second matrix for replaying GEMM kernels
+            mm1_dim1: dimension 1 of the second matrix for replaying GEMM kernels
+
+        Embedded Lookup Attributes:
+            direction: direction of embedding lookup kernel (forward or backward)
+            embDim: dimension size for Embedding table compute kernel
+            numEmbs: Embedding table hash size for Embedding table compute kernel
+            batchSize: number of samples reading the table concurrently
+            numEmbTables: number of embedding tables (per device)
+            numEmbTablesBatched: number of embedding tables batched together (-1 means no batching)
+            bagSize: bag size
     """
 
     def __init__(self, **kwargs) -> None:
@@ -535,7 +549,7 @@ class commsArgs:
         """
         self.comms = kwargs["comms"] if "comms" in kwargs else None
         self.compute = kwargs["compute"] if "compute" in kwargs else None
-        self.seqnum = kwargs["seqnum"] if "seqnum" in kwargs else None
+        self.id = kwargs["id"] if "id" in kwargs else None
         self.req = kwargs["req"] if "req" in kwargs else None
         self.inMsgSize = kwargs["inMsgSize"] if "inMsgSize" in kwargs else None
         self.outMsgSize = kwargs["outMsgSize"] if "outMsgSize" in kwargs else None
@@ -548,9 +562,20 @@ class commsArgs:
         self.worldSize = kwargs["worldSize"] if "worldSize" in kwargs else None
         self.markerStack = kwargs["markerStack"] if "markerStack" in kwargs else None
         self.root = kwargs["root"] if "root" in kwargs else None
-        self.eg_id = kwargs["eg_id"] if "eg_id" in kwargs else None
 
-        self.mm_dim = kwargs["mm_dim"] if "mm_dim" in kwargs else None
+        self.mm0_dim0 = kwargs["mm0_dim0"] if "mm0_dim0" in kwargs else None
+        self.mm0_dim1 = kwargs["mm0_dim0"] if "mm0_dim1" in kwargs else None
+        self.mm1_dim0 = kwargs["mm1_dim1"] if "mm1_dim0" in kwargs else None
+        self.mm1_dim1 = kwargs["mm1_dim1"] if "mm1_dim1" in kwargs else None
+
+        self.direction = kwargs["direction"] if "direction" in kwargs else 0
+        self.embDim = kwargs["embDim"] if "embDim" in kwargs else None
+        self.numEmbs = kwargs["numEmbs"] if "numEmbs" in kwargs else None
+        self.numEmbTables = kwargs["numEmbTables"] if "numEmbTable" in kwargs else None
+        self.numEmbTablesBatched = (
+            kwargs["numEmbTablesBatched"] if "numEmbTablesBatched" in kwargs else None
+        )
+        self.bagSize = kwargs["bagSize"] if "bagSize" in kwargs else None
 
     def toDict(self) -> Dict:
         """
@@ -562,14 +587,31 @@ class commsArgs:
             commData: Dictionary containing the comms metadata.
         """
         commData = {}
-        commData["comms"] = self.comms
+        if self.comms is not None:
+            commData["comms"] = self.comms
         if self.compute is not None:
             commData["compute"] = self.compute
-            if self.compute == "gemm":
-                if self.mm_dim is not None:
-                    commData["mm_dim"] = self.mm_dim
+            if commData["compute"] == "gemm":
+                if self.mm0_dim0 is not None:
+                    commData["mm0_dim0"] = self.mm0_dim0
+                if self.mm0_dim1 is not None:
+                    commData["mm0_dim1"] = self.mm0_dim1
+                if self.mm1_dim0 is not None:
+                    commData["mm1_dim0"] = self.mm1_dim0
+                if self.mm1_dim1 is not None:
+                    commData["mm1_dim1"] = self.mm1_dim1
+            elif commData["compute"] == "emb_lookup":
+                if self.embDim is not None:
+                    commData["embDim"] = self.embDim
+                if self.numEmbs is not None:
+                    commData["numEmbs"] = self.numEmbs
+                if self.numEmbTables is not None:
+                    commData["numEmbTables"] = self.numEmbTables
+                if self.numEmbTablesBatched is not None:
+                    commData["numEmbTablesBatched"] = self.numEmbTablesBatched
+                if self.bagSize is not None:
+                    commData["bagSize"] = self.bagSize
 
-        commData["seqnum"] = self.seqnum
         if self.req is not None:
             commData["req"] = self.req
         if self.inMsgSize is not None:
@@ -608,6 +650,19 @@ class commsArgs:
         Print out the commsArgs in human readable format.
         """
         return self.__dict__.__str__()
+
+    def toEmbLookupTuple(self):
+        """
+        Return tuple containing all values relevant to embedding lookup replay.
+        """
+        return (
+            self.direction,
+            self.emb_dim,
+            self.num_embs,
+            self.batch_size,
+            self.num_emb_tables_per_device,
+            self.bagSize,
+        )
 
 
 class paramStreamGuard(ContextDecorator):
@@ -676,6 +731,7 @@ class commsParamsHolderBase:
         self.size_from_trace = False
         self.init_method = args.init_method
         self.enable_local_report = args.enable_local_report
+        self.enable_profiler = args.enable_profiler
 
 
 class commsDlrmParamsHolder(commsParamsHolderBase):
@@ -877,20 +933,22 @@ class paramCommsBench(ABC):
         # reset values
         if self.collectiveArgs.collective in ("all_reduce", "reduce"):
             # all processes use initVal to have predictable results
-            tensor[:] = self.initVal
+            newVal = self.initVal
         elif self.collectiveArgs.collective in ("broadcast", "multicast"):
             # root process uses initVal and others use random values
-            tensor[:] = (
+            newVal = (
                 self.initVal
                 if (self.backendFuncs.get_global_rank() == self.collectiveArgs.srcOrDst)
                 else newVal
             )
-        elif isinstance(tensor, list):
+
+        # reset the tensor(s)
+        if isinstance(tensor, list):
             # could be a list of tensor, for all_gather, gather, reduce_scatter
             for t in tensor:
-                t[:] = newVal
+                t.fill_(newVal)
         else:
-            tensor[:] = newVal
+            tensor.fill_(newVal)
 
     # Collection of prepComm private methods. These methods prepare tensors for the respective collective.
 
@@ -1041,11 +1099,11 @@ class paramCommsBench(ABC):
                 )
             else:
                 ipTensor = self.backendFuncs.alloc_random(
-                    numElementsIn, curDevice, dtype, scaleFactor
+                    [numElementsIn], curDevice, dtype, scaleFactor
                 )
             # this is a single all gather with flat output tensor
             opTensor = self.backendFuncs.alloc_random(
-                numElementsOut,
+                [numElementsOut],
                 curDevice,
                 dtype,
                 scaleFactor,
@@ -1153,7 +1211,7 @@ class paramCommsBench(ABC):
                 )
             else:
                 ipTensor = self.backendFuncs.alloc_random(
-                    numElementsIn,
+                    [numElementsIn],
                     curDevice,
                     commsParams.dtype,
                     scaleFactor,
@@ -1187,17 +1245,45 @@ class paramCommsBench(ABC):
             )
         return (ipTensor, opTensor)
 
-    def prepGemm(
-        self, mm_dim: int, dtype: str, curDevice: str
+    def prepGemmNotSquare(
+        self,
+        mm0_dim0: int,
+        mm0_dim1: int,
+        mm1_dim0: int,
+        mm1_dim1: int,
+        dtype: str,
+        curDevice: str,
+        gemmTensor: torch.tensor = None,
     ) -> (torch.Tensor, torch.Tensor, torch.Tensor):
-        in1 = np.random.rand(mm_dim, mm_dim)
-        in2 = np.random.rand(mm_dim, mm_dim)
+        if gemmTensor is None:
+            in1 = np.random.rand(mm0_dim0, mm0_dim1)
+            in2 = np.random.rand(mm1_dim0, mm1_dim1)
 
-        MMin1 = torch.FloatTensor(in1).to(curDevice)
-        MMin2 = torch.FloatTensor(in2).to(curDevice)
-        MMout = self.backendFuncs.alloc_empty((mm_dim, mm_dim), dtype, curDevice)
+            MMin1 = torch.FloatTensor(in1).to(curDevice)
+            MMin2 = torch.FloatTensor(in2).to(curDevice)
+            MMout = self.backendFuncs.alloc_empty(
+                (mm0_dim0, mm1_dim1), dtype, curDevice
+            )
+        else:
+            mm_size0 = mm0_dim0 * mm0_dim1
+            mm_size1 = mm1_dim0 * mm1_dim1
+            out_size = mm0_dim0 * mm1_dim1
+            MMin1 = gemmTensor[0:mm_size0].view((mm0_dim0, mm0_dim1))
+            MMin2 = gemmTensor[mm_size0 : mm_size0 + mm_size1].view(
+                (mm1_dim0, mm1_dim1)
+            )
+            MMout = gemmTensor[
+                mm_size0 + mm_size1 : mm_size0 + mm_size1 + out_size
+            ].view((mm0_dim0, mm1_dim1))
 
         return MMout, MMin1, MMin2
+
+    def prepGemm(
+        self, mm_dim: int, dtype: str, curDevice: str, gemmTensor: torch.tensor = None
+    ) -> (torch.Tensor, torch.Tensor, torch.Tensor):
+        return self.prepGemmNotSquare(
+            mm_dim, mm_dim, mm_dim, mm_dim, dtype, curDevice, gemmTensor
+        )
 
     def prepComm(
         self,
@@ -1228,8 +1314,8 @@ class paramCommsBench(ABC):
         world_size = self.collectiveArgs.world_size
         dtype = commsParams.dtype
         curDevice = commsParams.device
-        # scaleFactor = 1 if commsParams.collective == "all_to_all" else numElements * numElements
-        scaleFactor = numElementsOut * numElementsOut
+        # seed to generate random value; let's use a small value to avoid potential "overflow when unpacking long"
+        scaleFactor = world_size
         opTensor = []
 
         if allocate:
@@ -1351,6 +1437,7 @@ class paramCommsBench(ABC):
         )  #  backend used for the network stack
         parser.add_argument(
             "--z",
+            "--blocking",
             type=int,
             default=0,
             help="use blocking/non-blocking mode for collectives",
@@ -1403,6 +1490,12 @@ class paramCommsBench(ABC):
             default=False,
             help="Toggle to enable all nodes' local rank report the output",
         )  # let all localRank-0 report the output
+        parser.add_argument(
+            "--enable-profiler",
+            action="store_true",
+            default=False,
+            help="toggle to enable pytorch profiler",
+        )  # enable pytorch profiler
         pass
 
     @abstractmethod
@@ -1488,6 +1581,7 @@ def init_emb_lookup(collectiveArgs, commsParams, backendFuncs):
     except ImportError:
         logger.error("benchmarking with emb_lookup kernels requires fbgemm_gpu library")
         return
+    collectiveArgs.direction = commsParams.direction
     collectiveArgs.emb_dim = commsParams.emb_dim
     num_embeddings = commsParams.num_embs
     collectiveArgs.batch_size = commsParams.batch_size
@@ -1530,3 +1624,17 @@ def init_emb_lookup(collectiveArgs, commsParams, backendFuncs):
         L=bag_size,
         E=num_embeddings,
     )
+
+    # If we are doing backward pass, then we need to initialize Lookup tensor using forward pass and grad output
+    if collectiveArgs.direction == "backward":
+        for i in range(len(collectiveArgs.embRequests)):
+            (indices, offsets, weights) = collectiveArgs.embRequests[i]
+            collectiveArgs.LookupOut = collectiveArgs.emb[i].forward(
+                indices,
+                offsets,
+                weights,
+            )
+
+        collectiveArgs.grad_output = torch.rand_like(collectiveArgs.LookupOut).to(
+            collectiveArgs.device
+        )

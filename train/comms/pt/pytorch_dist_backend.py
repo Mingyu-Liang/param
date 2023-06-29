@@ -605,13 +605,23 @@ class PyTorchDistBackend(backendFunctions):
             and self.use_ext_dist
         ):
             # Embedding table lookup as compute kernel
-            for i in range(len(collectiveArgs.embRequests)):
-                (indices, offsets, weights) = collectiveArgs.embRequests[i]
-                collectiveArgs.LookupOut = collectiveArgs.emb[i].forward(
-                    indices,
-                    offsets,
-                    weights,
-                )
+            # If forward pass
+            if collectiveArgs.direction == "forward":
+                for i in range(len(collectiveArgs.embRequests)):
+                    (indices, offsets, weights) = collectiveArgs.embRequests[i]
+                    collectiveArgs.LookupOut = collectiveArgs.emb[i].forward(
+                        indices,
+                        offsets,
+                        weights,
+                    )
+            # Otherwise backward pass
+            else:
+                for i in range(len(collectiveArgs.embRequests)):
+                    (indices, offsets, weights) = collectiveArgs.embRequests[i]
+                    collectiveArgs.LookupOut.backward(
+                        collectiveArgs.grad_output,
+                        retain_graph=collectiveArgs.reuseTensors,
+                    )
 
     # Memory related
     def get_mem_size(self, collectiveArgs, pair=False):
@@ -658,7 +668,7 @@ class PyTorchDistBackend(backendFunctions):
     ):
         if dtype in (torch.uint8, torch.int16, torch.int32, torch.long):
             ipTensor = torch.randint(
-                low=0, high=10, size=sizeArr, device=curRankDevice, dtype=dtype
+                low=0, high=10, size=tuple(sizeArr), device=curRankDevice, dtype=dtype
             )
         elif dtype == torch.bool:
             ipTensor = (

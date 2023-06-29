@@ -99,6 +99,8 @@ class commsTraceReplayBench(paramCommsBench):
         self.num_msg = 0
         self.is_blocking = True
         self.do_warm_up = True
+        self.reuse_tensors = False
+
         self.allowList = ""
         self.out_path = ""
         self.outputRanks = None
@@ -113,6 +115,7 @@ class commsTraceReplayBench(paramCommsBench):
 
         self.batchLat = []
         self.collLat: Dict[str, List] = {}
+        self.compLat: Dict[str, List] = {}
 
         self.comms_blocks: Dict[str, List] = {}
         self.traceWithPerf = []
@@ -123,10 +126,16 @@ class commsTraceReplayBench(paramCommsBench):
         # for blocking collectives this is the sum of all the collective latencies
         # for nonblocking collectives this is the sum of how long each collective took to be sent to the device
         self.totalCommsLatency = 0.0
+        # sum of all compute kernel latencies
+        self.totalCompsLatency = 0.0
         # how long it took to finish all collectives in the trace
         self.totalTraceLatency = 0.0
 
         self.eg_to_tensors = {}
+
+        self.gemmTensor = None
+
+        self.embLookupReuse = {}
 
     def readArgs(self, parser: argparse.ArgumentParser) -> None:
         """
@@ -181,6 +190,12 @@ class commsTraceReplayBench(paramCommsBench):
             action="store_true",
             default=self.do_warm_up,
             help="Toggle to disable performing extra replaying for warm-up",
+        )
+        parser.add_argument(
+            "--reuse-tensors",
+            action="store_true",
+            default=self.reuse_tensors,
+            help="Toggle to cache and reuse the same input/output for each compute kernel",
         )
         parser.add_argument(
             "--allow-ops",
@@ -402,9 +417,13 @@ class commsTraceReplayBench(paramCommsBench):
         self.max_msg_cnt = self.num_msg if self.max_msg_cnt == 0 else self.max_msg_cnt
         # first pass to know the statistics and get required info.
         for curComm in self.comms_trace[: self.max_msg_cnt]:
-            # skip compute-only kernels
-            if curComm.comms is None:
+            # record the current comp
+            if curComm.compute is not None:
+                compName = curComm.compute
+                if compName not in self.compLat.keys():
+                    self.compLat[compName] = []
                 continue
+
             # record the current comm
             collName = paramToCommName(curComm.comms)
             curBlocks = curComm.markerStack if curComm.markerStack is not None else []
@@ -518,7 +537,7 @@ class commsTraceReplayBench(paramCommsBench):
         Args:
             curComm: The current communication that we are preparing the correct tensor for.
             commsParams: Holds the comms param arguments that will determine tensor attributes.
-            regenerateTensors: when a eg_id is being replayed multiple times, setting this to false will use temsors from previous runs
+            regenerateTensors: when an id is being replayed multiple times, setting this to false will use temsors from previous runs
         Returns:
             (ipTensor, opTensor) if the current communication requires tensors, None otherwise.
         """
@@ -587,19 +606,19 @@ class commsTraceReplayBench(paramCommsBench):
         # This avoid regenerating sizes such as in _prep_all_gather_base
         commsParams.size_from_trace = True
         commsParams.dtype = self.dtypeMap[curComm.dtype]
-        if not curComm.eg_id:
+        if not curComm.id:
             return super().prepComm(curComm, commsParams)
 
         if regenerateTensors:
             return super().prepComm(curComm, commsParams)
         else:
-            if curComm.eg_id in self.eg_to_tensors:
+            if curComm.id in self.eg_to_tensors:
                 # Allocate input/output tensors if first time replay, otherwise the previous ones.
                 super().prepComm(curComm, commsParams, False)
-                (ipTensor, opTensor) = self.eg_to_tensors[curComm.eg_id]
+                (ipTensor, opTensor) = self.eg_to_tensors[curComm.id]
             else:
                 (ipTensor, opTensor) = super().prepComm(curComm, commsParams, True)
-                self.eg_to_tensors[curComm.eg_id] = (ipTensor, opTensor)
+                self.eg_to_tensors[curComm.id] = (ipTensor, opTensor)
         return (ipTensor, opTensor)
 
     def warmUpBench(self, commsParams: commsParamsHolderBase) -> None:
@@ -655,7 +674,7 @@ class commsTraceReplayBench(paramCommsBench):
                 (
                     self.collectiveArgs.ipTensor,
                     self.collectiveArgs.opTensor,
-                ) = self.prepComms(commEntry, commsParams)
+                ) = self.prepComms(commEntry, commsParams, not self.reuse_tensors)
 
             if commName in self.backendFuncs.collectiveFunc.keys():
                 self.backendFuncs.collectiveFunc[commName](self.collectiveArgs)
@@ -686,7 +705,9 @@ class commsTraceReplayBench(paramCommsBench):
                 backendFuncs=self.backendFuncs,
                 is_blocking=self.is_blocking,  # for blocking case, stream synchornization will be performed
             ):
-                func(self.collectiveArgs)
+                # Post the kernel *computeCount* times
+                for _ in range(self.collectiveArgs.computeCount):
+                    func(self.collectiveArgs)
 
         # For compute, latency and global_latency are the same
         global_latency = latency = computeTimer.getTimeUS()
@@ -732,9 +753,8 @@ class commsTraceReplayBench(paramCommsBench):
                 )
 
             # if blocking, post outstanding ops and wait for them to complete. if nonblocking, just post op
-            self.backendFuncs.complete_accel_ops(
-                self.collectiveArgs, devSync=self.is_blocking
-            )
+            if self.is_blocking:
+                self.backendFuncs.complete_accel_ops(self.collectiveArgs)
 
             # if nonblocking, then store the pair {reqID, future} so that we can wait on it later
             # check if req id is recorded in trace for backwards compatibility
@@ -773,6 +793,122 @@ class commsTraceReplayBench(paramCommsBench):
                 if timeDiff / 1e9 >= LOOP_TIMER_S:  # make it seconds
                     time.sleep(LOOP_TIMER_S)
 
+    def prepComputeReplay(self, commsParams: commsParamsHolderBase, curComm):
+        computeFunc = None
+
+        # Set the computeCount, which is the number of time to run the compute kernel
+        self.collectiveArgs.computeCount = curComm.count
+
+        # Set reuseTensors, which is whether we reuse the tensors between kernels
+        self.collectiveArgs.reuseTensors = self.reuse_tensors
+
+        # Prep to run GEMM kernel
+        if curComm.compute == "gemm":
+            if self.gemmTensor is None and self.reuse_tensors:
+                self.gemmTensor = self.backendFuncs.alloc_random(
+                    [1073741824],
+                    self.collectiveArgs.device,
+                    self.dtypeMap[curComm.dtype],
+                )
+
+            (
+                self.collectiveArgs.MMout,
+                self.collectiveArgs.MMin1,
+                self.collectiveArgs.MMin2,
+            ) = self.prepGemmNotSquare(
+                curComm.mm0_dim0,
+                curComm.mm0_dim1,
+                curComm.mm1_dim0,
+                curComm.mm1_dim1,
+                self.dtypeMap[curComm.dtype],
+                self.collectiveArgs.device,
+                self.gemmTensor if self.reuse_tensors else None,
+            )
+
+            computeFunc = self.backendFuncs.gemm
+
+        # Prep to run TBE/embedding lookup kernel
+        elif curComm.compute == "emb_lookup":
+            # Check if we are to reuse tensors and emb lookup call has been done before -- shortcut init if so
+            if (
+                curComm.toEmbLookupTuple() in self.embLookupReuse.keys()
+                and self.reuse_tensors
+            ):
+                if curComm.direction == "forward":
+                    (
+                        self.collectiveArgs.embRequests,
+                        self.collectiveArgs.emb,
+                    ) = self.embLookupReuse[curComm.toEmbLookupTuple()]
+                else:
+                    (
+                        self.collectiveArgs.embRequests,
+                        self.collectiveArgs.LookupOut,
+                        self.collectiveArgs.grad_output,
+                    ) = self.embLookupReuse[curComm.toEmbLookupTuple()]
+
+            # Otherwise, do init, then add to dictionary if reuse tensors is enabled
+            else:
+                curComm.device = commsParams.device
+                comms_utils.init_emb_lookup(
+                    self.collectiveArgs, curComm, self.backendFuncs
+                )
+                if self.reuse_tensors:
+                    if curComm.direction == "forward":
+                        self.embLookupReuse[curComm.toEmbLookupTuple()] = (
+                            self.collectiveArgs.embRequests,
+                            self.collectiveArgs.emb,
+                        )
+                    else:
+                        self.embLookupReuse[curComm.toEmbLookupTuple()] = (
+                            self.collectiveArgs.embRequests,
+                            self.collectiveArgs.LookupOut,
+                            self.collectiveArgs.grad_output,
+                        )
+
+            # Set embedded lookup as function to run
+            computeFunc = self.backendFuncs.emb_lookup
+
+        # Spawn the compute stream if it was not already created
+        if self.collectiveArgs.compute_stream is None:
+            self.collectiveArgs.compute_stream = self.backendFuncs.get_new_stream()
+
+        return computeFunc
+
+    def recordCommReplay(
+        self,
+        commsParams: commsParamsHolderBase,
+        curComm,
+        collName,
+        latency,
+        curBlockStack,
+        global_latency,
+        curBlocks,
+    ):
+        recordComm = curComm.toDict()
+
+        recordComm["marker_stack"] = curBlockStack
+        recordComm["quant_us"] = self.collectiveArgs.quant_time.getTimeUS()
+        recordComm["dequant_us"] = self.collectiveArgs.dequant_time.getTimeUS()
+        recordComm["latency_us"] = latency
+        recordComm["global_latency_us"] = global_latency
+
+        # record compute metrics
+        if curComm.compute is not None:
+            self.compLat[collName].append(latency)
+            self.totalCompsLatency += latency
+        else:
+            # record comm metrics
+            self.collLat[collName].append(latency)
+            self.totalCommsLatency += latency
+
+            # record comm block metrics
+            # categorized by the marker
+            for curBlock in curBlocks:
+                # elem_size = self.collectiveArgs.ipTensor.element_size()
+                self.comms_blocks[curBlock].append(recordComm)
+        # Keep a copy of trace with performance (latency) and id
+        self.traceWithPerf.append(recordComm)
+
     def replayTrace(self, commsParams: commsParamsHolderBase) -> None:
         """
         Replay comms trace.
@@ -790,37 +926,25 @@ class commsTraceReplayBench(paramCommsBench):
                 " ".join(curBlocks) if len(curBlocks) > 0 else "Unamed/Unknown"
             )
 
+            # Replay compute
             if curComm.compute is not None:
-                computeFunc = None
-                if curComm.compute == "gemm":
-                    (
-                        self.collectiveArgs.MMout,
-                        self.collectiveArgs.MMin1,
-                        self.collectiveArgs.MMin2,
-                    ) = self.prepGemm(
-                        curComm.mm_dim,
-                        self.dtypeMap[curComm.dtype],
-                        self.collectiveArgs.device,
-                    )
-                    computeFunc = self.backendFuncs.gemm
+                # Prepare to run the compute function
+                computeFunc = self.prepComputeReplay(commsParams, curComm)
+
+                # Running the kernel
                 logger.info(
                     f"[Rank {self.collectiveArgs.global_rank:3}] [{cnt} / {self.max_msg_cnt}] Replaying {curComm.compute}"
                 )
-                if self.collectiveArgs.compute_stream is None:
-                    self.collectiveArgs.compute_stream = (
-                        self.backendFuncs.get_new_stream()
-                    )
 
+                # Run the kernel and report the total time
                 (latency, global_latency) = self.runCompute(
                     func=computeFunc, curBlockStack=curBlockStack
                 )
+                recordName = curComm.compute
 
-                if self.backendFuncs.get_global_rank() == 0:
-                    logger.info(
-                        f"[{cnt} / {self.max_msg_cnt}] Replayed {curComm.compute} in block [{curBlockStack}]... {global_latency:.2f} us"
-                    )
-                continue
+            # Replay comm
             else:
+                # Get the name of the collective from the comm object
                 collName = paramToCommName(curComm.comms)
 
                 (groupRank, groupDesc) = self.getCommGroupInfo(curComm, commsParams)
@@ -837,7 +961,7 @@ class commsTraceReplayBench(paramCommsBench):
                 (
                     self.collectiveArgs.ipTensor,
                     self.collectiveArgs.opTensor,
-                ) = self.prepComms(curComm, commsParams)
+                ) = self.prepComms(curComm, commsParams, not self.reuse_tensors)
 
                 if self.colls_per_batch > 0 and coll_in_batch_num == 0:
                     batch_begin = time.monotonic()
@@ -875,46 +999,38 @@ class commsTraceReplayBench(paramCommsBench):
                         coll_in_batch_num = 0
                         self.batchLat.append(batch_latency)
 
-                # record comm metrics
-                self.collLat[collName].append(latency)
-                self.totalCommsLatency += latency
+                recordName = collName
 
-                recordComm = curComm.toDict()
+            # record performance metrics
+            self.recordCommReplay(
+                commsParams,
+                curComm,
+                recordName,
+                latency,
+                curBlockStack,
+                global_latency,
+                curBlocks,
+            )
 
-                recordComm["marker_stack"] = curBlockStack
-                recordComm["quant_us"] = self.collectiveArgs.quant_time.getTimeUS()
-                recordComm["dequant_us"] = self.collectiveArgs.dequant_time.getTimeUS()
-                recordComm["latency_us"] = latency
-                recordComm["global_latency_us"] = global_latency
-
-                # record comm block metrics
-                # categorized by the marker
-                for curBlock in curBlocks:
-                    # elem_size = self.collectiveArgs.ipTensor.element_size()
-                    self.comms_blocks[curBlock].append(recordComm)
-
-                # Keep a copy of trace with performance (latency) and seqnum
-                self.traceWithPerf.append(recordComm)
-
-                if self.backendFuncs.get_global_rank() == 0:
-                    logger.info(
-                        f"[{cnt} / {self.max_msg_cnt}] Replayed {collName} in block [{curBlockStack}]... {global_latency:.2f} us"
-                    )
+            if self.backendFuncs.get_global_rank() == 0:
+                logger.info(
+                    f"[{cnt} / {self.max_msg_cnt}] Replayed {recordName} in block [{curBlockStack}]... {global_latency:.2f} us"
+                )
 
     def replaySingle(
-        self, commsParams: commsParamsHolderBase, eg_id: int, regenerateTensors: True
+        self, commsParams: commsParamsHolderBase, id: int, regenerateTensors: True
     ) -> torch.tensor:
         """
         Replay comms trace.
 
         Args:
             commsParams: Run-time parameters for replay.
-            eg_id: comms op id in execution graph.
+            id: comms op id.
         Returns:
             Output tensor.
         """
         for _, curComm in enumerate(self.comms_trace[: self.max_msg_cnt]):
-            if curComm.eg_id == eg_id:
+            if curComm.id == id:
                 collName = paramToCommName(curComm.comms)
                 if collName not in self.allowList:
                     return
@@ -968,7 +1084,6 @@ class commsTraceReplayBench(paramCommsBench):
             "startTimeNs": 0
             "markerStack": ["## all2all ##"]
             "comms": "all_to_allv",
-            "seqnum": 0
             "req": 0
             "inMsgSize": 10357149,
             "outMsgSize": 23093760,
@@ -982,7 +1097,6 @@ class commsTraceReplayBench(paramCommsBench):
             "startTimeNs": 0
             "markerStack": ["## all2all ##"]
             "comms": "all_reduce",
-            "seqnum": 0
             "req": 0
             "inMsgSize": 1048576,
             "outMsgSize": 1048576,
@@ -993,7 +1107,6 @@ class commsTraceReplayBench(paramCommsBench):
         {
             "startTimeNs": 0
             "markerStack": ["## all2all ##"]
-            "seqnum": 0
             "req": 0
             "comms": "wait",
             "worldSize": 16
@@ -1008,8 +1121,18 @@ class commsTraceReplayBench(paramCommsBench):
         Returns:
             None
         """
+        if commsParams.enable_profiler:
+            self.collectiveArgs.enable_profiler = comms_utils.startProfiler(
+                rank=self.backendFuncs.get_global_rank(),
+                device=self.collectiveArgs.device,
+                numWarmupIters=1 if self.do_warm_up else 0,
+                numIters=self.num_replays + 1 if self.do_warm_up else self.num_replays,
+            )
+
         # warm-up
         if self.do_warm_up:
+            if self.collectiveArgs.enable_profiler:
+                comms_utils.sampleProfiler()
             self.warmUpBench(commsParams)
         self.resetComms()
 
@@ -1028,6 +1151,9 @@ class commsTraceReplayBench(paramCommsBench):
             if self.backendFuncs.get_global_rank() == 0:
                 logger.info(f"Replay #{i}")
 
+            if self.collectiveArgs.enable_profiler:
+                comms_utils.sampleProfiler()
+
             # replay comms trace
             self.replayTrace(commsParams)
             self.resetComms()
@@ -1038,6 +1164,11 @@ class commsTraceReplayBench(paramCommsBench):
         # record how long it took for trace-replay to complete
         traceEndTime = time.monotonic_ns()
         self.totalTraceLatency = (traceEndTime - traceStartTime) / 1e3  # make it us
+
+        # stop profiler if used
+        if self.collectiveArgs.enable_profiler:
+            comms_utils.sampleProfiler(stop=True)
+            self.collectiveArgs.enable_profiler = False
 
         # cleanup any memory left in use
         self.backendFuncs.clear_memory(self.collectiveArgs)
@@ -1202,6 +1333,7 @@ class commsTraceReplayBench(paramCommsBench):
         self.collectiveArgs.ipTensor = None
         self.collectiveArgs.opTensor = None
         self.collectiveArgs.quant_threshold = commsParams.quant_threshold
+        self.collectiveArgs.enable_profiler = commsParams.enable_profiler
 
         # set of collectives to be replayed
         if self.allowList in ("all", "default", "*"):
@@ -1226,6 +1358,7 @@ class commsTraceReplayBench(paramCommsBench):
         self.max_msg_cnt = args.max_msg_cnt
         self.is_blocking = args.z
         self.do_warm_up = args.do_warm_up
+        self.reuse_tensors = args.reuse_tensors
         self.allowList = args.allow_ops
         if args.output_ranks == "all":
             self.outputRanks = [*range(self.backendFuncs.get_world_size())]
@@ -1337,7 +1470,7 @@ def extractCommsInfo(in_trace: List[Dict]) -> List[commsArgs]:
     for cnt, curComm in enumerate(in_trace):
         newComm = commsArgs()
         newComm.comms = paramToCommName(curComm["comms"].lower())
-        newComm.seqnum = cnt
+        newComm.id = cnt
         if "req" in curComm:
             newComm.req = curComm["req"]
         if "startTime_ns" in curComm:
