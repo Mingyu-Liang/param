@@ -151,7 +151,7 @@ def train_gpu_with_autocast(
         if i >= args.warmups:
             start_event.record()
         loss = None
-        if not args.fw_only:s
+        if not args.fw_only:
             optimizer.zero_grad(set_to_none=args.set_to_none)
         with autocast(dtype=dt):
             output = model(data)
