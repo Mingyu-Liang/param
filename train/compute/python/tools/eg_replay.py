@@ -1,20 +1,15 @@
 import argparse
-import gc
-import json
-
 import fbgemm_gpu
 from fbgemm_gpu.split_table_batched_embeddings_ops import PoolingMode, WeightDecayMode
-
-import logging
-import time
 from collections import defaultdict
 from datetime import datetime
 from functools import reduce
-
-# import comms_utils
+import gc
+import json
+import logging
 import numpy as np
+import time
 import torch
-# from param_bench.train.comms.pt import commsTraceReplay
 
 from param_bench.train.compute.python.lib import pytorch as lib_pytorch
 from param_bench.train.compute.python.lib.init_helper import load_modules
