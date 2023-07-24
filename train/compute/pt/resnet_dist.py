@@ -8,7 +8,7 @@ import torchvision.transforms as transforms
 import torchvision.models as models
 import torchvision.datasets as datasets
 import torch.utils.data.distributed
-from torch.profiler import ExecutionGraphObserver, ProfilerActivity, record_function
+from torch.profiler import ExecutionTraceObserver, ProfilerActivity, record_function
 
 # print("PyTorch version: ", torch.__version__)
 
@@ -18,13 +18,13 @@ def profiler_trace_handler(p):
     global rank_id
     p.export_chrome_trace(f'/zhang-x3/users/ml2585/eg_logs/resnet_dist_trace_{rank_id}.json')
 
-def train(rank, world_size, warmups, steps, eg, profile):
+def train(rank, world_size, warmups, steps, eg, profile, compile):
     os.environ['MASTER_ADDR'] = 'localhost'
     os.environ['MASTER_PORT'] = '12355'
 
     if eg:
         eg_file = f'/zhang-x3/users/ml2585/eg_logs/resnet_dist_eg_{rank}.json'
-        eg = ExecutionGraphObserver()
+        eg = ExecutionTraceObserver()
         eg.register_callback(eg_file)
 
         eg.start()
@@ -37,6 +37,9 @@ def train(rank, world_size, warmups, steps, eg, profile):
 
     # Set up the ResNet-18 model
     model = models.resnet18()
+
+    if compile:
+        model = torch.compile(model)
 
     device = torch.device('cuda', rank + 1)
 
@@ -143,7 +146,8 @@ if __name__ == '__main__':
     parser.add_argument("--steps", type=int, default=20)
     parser.add_argument("--profile", action="store_true")
     parser.add_argument("--workers", type=int, default=1)
+    parser.add_argument("--compile", default=False, action="store_true")
 
     args = parser.parse_args()
     # Spawn the worker processes
-    mp.spawn(train, args=(args.workers, args.warmups, args.steps, args.eg, args.profile), nprocs=args.workers, join=True)
+    mp.spawn(train, args=(args.workers, args.warmups, args.steps, args.eg, args.profile, args.compile), nprocs=args.workers, join=True)

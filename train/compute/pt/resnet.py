@@ -2,44 +2,48 @@ import time
 import torch
 import torchvision
 import torchvision.transforms as transforms
-from torch.profiler import ExecutionGraphObserver, ProfilerActivity, record_function
+from torch.profiler import ExecutionTraceObserver, ProfilerActivity, record_function
 
 
 print("PyTorch version: ", torch.__version__)
 
-# Define transforms for the training and validation datasets
-transform_train = transforms.Compose([
-    transforms.RandomResizedCrop(224),
-    transforms.RandomHorizontalFlip(),
-    transforms.ToTensor(),
-    transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
-])
-
-transform_val = transforms.Compose([
-    transforms.Resize(256),
-    transforms.CenterCrop(224),
-    transforms.ToTensor(),
-    transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
-])
-
-# Load the ImageNet dataset
-trainset = torchvision.datasets.ImageFolder(root='/work/zhang-x3/common/datasets/imagenet-pytorch/train', transform=transform_train)
-trainloader = torch.utils.data.DataLoader(trainset, batch_size=128, shuffle=True, num_workers=4)
-
-valset = torchvision.datasets.ImageFolder(root='/work/zhang-x3/common/datasets/imagenet-pytorch/val', transform=transform_val)
-valloader = torch.utils.data.DataLoader(valset, batch_size=128, shuffle=False, num_workers=4)
-
-# Define the ResNet18 model
-model = torchvision.models.resnet18(pretrained=False)
-
-torch.set_num_interop_threads(10)
-
 def profiler_trace_handler(p):
     p.export_chrome_trace("/zhang-x3/users/ml2585/eg_logs/resnet_trace_iters.json")
 
-def train(warmups, steps, profile, eg, cuda):
+def train(warmups, steps, profile, eg, cuda, compile):
+    # Define transforms for the training and validation datasets
+    transform_train = transforms.Compose([
+        transforms.RandomResizedCrop(224),
+        transforms.RandomHorizontalFlip(),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+    ])
+
+    transform_val = transforms.Compose([
+        transforms.Resize(256),
+        transforms.CenterCrop(224),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+    ])
+
+    # Load the ImageNet dataset
+    trainset = torchvision.datasets.ImageFolder(root='/work/zhang-x3/common/datasets/imagenet-pytorch/train', transform=transform_train)
+    trainloader = torch.utils.data.DataLoader(trainset, batch_size=128, shuffle=True, num_workers=4)
+
+    valset = torchvision.datasets.ImageFolder(root='/work/zhang-x3/common/datasets/imagenet-pytorch/val', transform=transform_val)
+    valloader = torch.utils.data.DataLoader(valset, batch_size=128, shuffle=False, num_workers=4)
+
+    # Define the ResNet18 model
+    model = torchvision.models.resnet18()
+
+    if compile:
+        model = torch.compile(model)
+
+    torch.set_num_interop_threads(10)
+
     # Use GPU if available
     device = torch.device(f"cuda:{cuda}" if torch.cuda.is_available() else "cpu")
+
     model.to(device)
 
     # Define the loss function and optimizer
@@ -48,7 +52,7 @@ def train(warmups, steps, profile, eg, cuda):
 
     if eg:
         eg_file = f"/zhang-x3/users/ml2585/eg_logs/resnet_eg_iter{warmups}.json"
-        eg = ExecutionGraphObserver()
+        eg = ExecutionTraceObserver()
         eg.register_callback(eg_file)
     
     if profile:
@@ -61,7 +65,7 @@ def train(warmups, steps, profile, eg, cuda):
             # Train the model
             for epoch in range(10):
                 # running_loss = 0.0
-                accumulated_loss = torch.cuda.FloatTensor([0.0])
+                accumulated_loss = torch.tensor([0.0], dtype=float, device='cuda')
                 for i, data in enumerate(trainloader, 0):
                     if eg:
                         if i == warmups:
@@ -145,7 +149,8 @@ if __name__ == "__main__":
     parser.add_argument("--steps", type=int, default=50)
     parser.add_argument("--profile", action="store_true")
     parser.add_argument("--cuda", type=int, default=0)
+    parser.add_argument("--compile", default=False, action="store_true")
 
     args = parser.parse_args()
 
-    train(args.warmups, args.steps, args.profile, args.eg, args.cuda)
+    train(args.warmups, args.steps, args.profile, args.eg, args.cuda, args.compile)

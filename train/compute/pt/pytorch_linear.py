@@ -9,7 +9,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from torch.profiler import ExecutionGraphObserver, ProfilerActivity
+from torch.profiler import ExecutionTraceObserver, ProfilerActivity
 
 class Net(nn.Module):
     def __init__(self, layers_size):
@@ -77,6 +77,11 @@ def train_gpu_with_explicit_cast(
     if data_type == "float16" or data_type == "bfloat16":
         print("Converting weights explicitly to ", data_type, " data type")
         model = convert_to_datatype(model, data_type)
+
+    if args.compile:
+        # Use pt2 new feature
+        model = torch.compile(model)
+
     loss_f = nn.CrossEntropyLoss().to(device)
     torch.cuda.synchronize()
     start_event = torch.cuda.Event(enable_timing=True)
@@ -84,7 +89,7 @@ def train_gpu_with_explicit_cast(
     total_time = 0.0
 
     eg_file = "/zhang-x3/users/ml2585/eg_logs/linear_eg.json"
-    eg = ExecutionGraphObserver()
+    eg = ExecutionTraceObserver()
     eg.register_callback(eg_file)
 
     data = torch.randn(batch_size, input_size, device=device)
@@ -464,6 +469,7 @@ if __name__ == "__main__":
     )
     parser.add_argument("--steps", type=int, default=100)
     parser.add_argument("--warmups", type=int, default=10)
+    parser.add_argument("--compile", default=False, action="store_true")
 
     args = parser.parse_args()
     batch_size = args.batch_size
