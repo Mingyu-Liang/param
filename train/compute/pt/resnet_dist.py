@@ -12,18 +12,20 @@ from torch.profiler import ExecutionTraceObserver, ProfilerActivity, record_func
 
 # print("PyTorch version: ", torch.__version__)
 
+os.environ["TORCH_COMPILE_DEBUG"] = "1"
+
 rank_id = 0
 
 def profiler_trace_handler(p):
     global rank_id
-    p.export_chrome_trace(f'/zhang-x3/users/ml2585/eg_logs/resnet_dist_trace_{rank_id}.json')
+    p.export_chrome_trace(f'/zhang-x3/users/ml2585/eg_logs/resnet_dist_trace_{rank_id}_pt2.json')
 
 def train(rank, world_size, warmups, steps, eg, profile, compile):
     os.environ['MASTER_ADDR'] = 'localhost'
     os.environ['MASTER_PORT'] = '12355'
 
     if eg:
-        eg_file = f'/zhang-x3/users/ml2585/eg_logs/resnet_dist_eg_{rank}.json'
+        eg_file = f'/zhang-x3/users/ml2585/eg_logs/resnet_dist_eg_{rank}_pt2.json'
         eg = ExecutionTraceObserver()
         eg.register_callback(eg_file)
 
@@ -38,9 +40,6 @@ def train(rank, world_size, warmups, steps, eg, profile, compile):
     # Set up the ResNet-18 model
     model = models.resnet18()
 
-    if compile:
-        model = torch.compile(model)
-
     device = torch.device('cuda', rank + 1)
 
     global rank_id
@@ -50,6 +49,9 @@ def train(rank, world_size, warmups, steps, eg, profile, compile):
 
     # Wrap the model with DDP
     model = nn.parallel.DistributedDataParallel(model)
+
+    if compile:
+        model = torch.compile(model)
 
     # Define the loss function and optimizer
     criterion = nn.CrossEntropyLoss()
