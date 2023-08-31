@@ -9,6 +9,51 @@ def read_dictionary_from_json(file_path):
         return data
 
 
+def analyze_iteration(trace_events):
+    cpu_ops = [event for event in trace_events if 'cat' in event and (event['cat'] == 'cpu_op' or event['cat'] == 'user_annotation')]
+    cpu_ops = sorted(cpu_ops, key=lambda kv: kv['ts'])
+
+    segments = {}
+    segment = []
+    last_segment_name = ''
+
+    for op in cpu_ops:
+        if 'ProfilerStep' in op['name']:
+            if last_segment_name != '':
+                segments[last_segment_name] = segment
+            last_segment_name = op['name']
+            segment = []
+        else:
+            segment.append(op)
+
+    segments[last_segment_name] = segment
+
+    segments_duration = {}
+    for key, ops in segments.items():
+        start_ts = ops[0]['ts']
+        end_ts = ops[0]['ts'] + ops[0]['dur']
+        for op in ops[1:]:
+            start_ts = min(start_ts, op['ts'])
+            end_ts = max(end_ts, op['ts'] + op['dur'])
+        segments_duration[key] = (end_ts - start_ts)/ 1000.0
+
+    # print(segments_duration)
+    print(f'Avg: {statistics.mean(segments_duration.values())}, std: {statistics.stdev(segments_duration.values())}, max: {max(segments_duration.values())}, min: {min(segments_duration.values())}')
+
+
+def analyze_nccl(trace_events):
+    nccl_kernels = [event for event in trace_events if 'cat' in event and event['cat'] == 'kernel' and 'name' in event and event['name'].startswith('nccl')]
+    nccl_kernels_durations = {}
+    for kernel in nccl_kernels:
+        if kernel['name'] not in nccl_kernels_durations:
+            nccl_kernels_durations[kernel['name']] = []
+        nccl_kernels_durations[kernel['name']].append(kernel['dur'] / 1000.0)
+
+    # print(nccl_kernels_durations.keys())
+    for key, value in nccl_kernels_durations.items():
+        print(key, ' avg: ', statistics.mean(value), ' std: ', statistics.stdev(value), ' max: ', max(value), ' min: ', min(value))
+
+
 def analyze_cpu_ops_duration(trace_events):
     cpu_ops = {}
 
@@ -145,12 +190,17 @@ def analyze_kernels_duration(trace_events):
 
 
 # Example usage
-file_path = '/zhang-x3/users/ml2585/eg_logs/resnet_trace_new.json'  # Replace with your JSON file path
+file_path = '/zhang-x3/users/ml2585/eg_logs/resnet_dist_1/resnet_dist_trace_0.json'  # Replace with your JSON file path
 # file_path = '/tmp/tmp_20230530_21b8d82_287757.json'
 dictionary = read_dictionary_from_json(file_path)
 print(dictionary.keys())
 
 trace_events = dictionary['traceEvents']
+
+analyze_iteration(trace_events)
+analyze_nccl(trace_events)
+
+exit(1)
 
 # analyze_cpu_ops_duration(trace_events)
 
