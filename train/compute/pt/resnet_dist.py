@@ -12,20 +12,33 @@ from torch.profiler import ExecutionTraceObserver, ProfilerActivity, record_func
 
 # print("PyTorch version: ", torch.__version__)
 
-os.environ["TORCH_COMPILE_DEBUG"] = "1"
+# os.environ["TORCH_COMPILE_DEBUG"] = "1"
 
 rank_id = 0
+pt2 = False
+trace_folder_path = ''
 
 def profiler_trace_handler(p):
     global rank_id
-    p.export_chrome_trace(f'/zhang-x3/users/ml2585/eg_logs/resnet_dist_trace_{rank_id}_pt2.json')
+    global pt2
+    global trace_folder_path
+    
+    if pt2:
+        p.export_chrome_trace(f'{trace_folder_path}/resnet_dist_trace_{rank_id}_pt2.json')
+    else:
+        p.export_chrome_trace(f'{trace_folder_path}/resnet_dist_trace_{rank_id}.json')
 
-def train(rank, world_size, warmups, steps, eg, profile, compile):
+
+def train(rank, world_size, warmups, steps, eg, profile, pt2, trace_folder):
     os.environ['MASTER_ADDR'] = 'localhost'
     os.environ['MASTER_PORT'] = '12355'
 
     if eg:
-        eg_file = f'/zhang-x3/users/ml2585/eg_logs/resnet_dist_eg_{rank}_pt2.json'
+        if pt2:
+            eg_file = f'{trace_folder}/resnet_dist_et_{rank}_pt2.json'
+        else:
+            eg_file = f'{trace_folder}/resnet_dist_et_{rank}.json'
+
         eg = ExecutionTraceObserver()
         eg.register_callback(eg_file)
 
@@ -40,17 +53,19 @@ def train(rank, world_size, warmups, steps, eg, profile, compile):
     # Set up the ResNet-18 model
     model = models.resnet18()
 
-    device = torch.device('cuda', rank + 1)
+    device = torch.device('cuda', rank)
 
     global rank_id
     rank_id = rank
+    global trace_folder_path
+    trace_folder_path = trace_folder
 
     model.to(device)
 
     # Wrap the model with DDP
     model = nn.parallel.DistributedDataParallel(model)
 
-    if compile:
+    if pt2:
         model = torch.compile(model)
 
     # Define the loss function and optimizer
@@ -148,8 +163,17 @@ if __name__ == '__main__':
     parser.add_argument("--steps", type=int, default=20)
     parser.add_argument("--profile", action="store_true")
     parser.add_argument("--workers", type=int, default=1)
-    parser.add_argument("--compile", default=False, action="store_true")
+    parser.add_argument("--pt2", default=False, action="store_true")
 
     args = parser.parse_args()
+
+    trace_folder = f'/zhang-x3/users/ml2585/eg_logs/resnet_dist_{args.workers}'
+
+    if not os.path.exists(trace_folder):
+        os.makedirs(trace_folder)
+
+    # Set the pt2 global variable based on command-line argument
+    pt2 = args.pt2
+
     # Spawn the worker processes
-    mp.spawn(train, args=(args.workers, args.warmups, args.steps, args.eg, args.profile, args.compile), nprocs=args.workers, join=True)
+    mp.spawn(train, args=(args.workers, args.warmups, args.steps, args.eg, args.profile, args.pt2, trace_folder), nprocs=args.workers, join=True)
