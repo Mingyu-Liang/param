@@ -88,6 +88,43 @@ def analyze_cpu_ops_duration(trace_events):
     print('top 20 cpu ops duration fraction: ', sum([cpu_op[1] for cpu_op in top20_cpu_ops])/cpu_ops_duration_total)
 
 
+def analyze_top_cpu_ops(trace_events):
+    sorted_trace_events = sorted(trace_events, key=lambda kv: kv['ts'])
+
+    cpu_events = [event for event in sorted_trace_events if 'cat' in event and event['cat'] == 'cpu_op']
+    top_cpu_events = [cpu_events[0]]
+    for event in cpu_events[1:]:
+        if event['ts'] < top_cpu_events[-1]['ts'] + top_cpu_events[-1]['dur']:
+            continue
+        else:
+            top_cpu_events.append(event)
+    
+    top_cpu_ops = {}
+    for event in top_cpu_events:
+        if event['name'] not in top_cpu_ops:
+            top_cpu_ops[event['name']] = {}
+            top_cpu_ops[event['name']]['duration'] = []
+            top_cpu_ops[event['name']]['duration'].append(event['dur'])
+        else:
+            top_cpu_ops[event['name']]['duration'].append(event['dur'])    
+
+    top_cpu_ops_durations = {}
+    for cpu_op in top_cpu_ops:
+        top_cpu_ops_durations[cpu_op] = sum(top_cpu_ops[cpu_op]['duration'])
+
+    top_cpu_ops_duration_total = sum(top_cpu_ops_durations.values())
+    sorted_top_cpu_ops_durations = sorted(top_cpu_ops_durations.items(), key=lambda kv: kv[1], reverse=True)
+    
+    for cpu_op in sorted_top_cpu_ops_durations:
+        print(cpu_op, ' fraction: ', cpu_op[1]/top_cpu_ops_duration_total, ' avg: ', cpu_op[1] / len(top_cpu_ops[cpu_op[0]]['duration']) / 1000.0)
+
+    print('Total cpu ops duration: ', top_cpu_ops_duration_total)
+    top10_top_cpu_ops = sorted_top_cpu_ops_durations[:10]
+    print('top 10 top cpu ops duration fraction: ', sum([cpu_op[1] for cpu_op in top10_top_cpu_ops])/top_cpu_ops_duration_total)
+    top20_top_cpu_ops = sorted_top_cpu_ops_durations[:20]
+    print('top 20 top cpu ops duration fraction: ', sum([cpu_op[1] for cpu_op in top20_top_cpu_ops])/top_cpu_ops_duration_total)
+
+        
 def analyze_cpu_ops_duration_under_specific_iteration(trace_events, iteration_name):
     iteration = [event for event in trace_events if 'name' in event and event['name'] == iteration_name]
     assert(len(iteration) == 1)
@@ -190,7 +227,7 @@ def analyze_kernels_duration(trace_events):
 
 
 # Example usage
-file_path = '/zhang-x3/users/ml2585/eg_logs/resnet_dist_1/resnet_dist_trace_0.json'  # Replace with your JSON file path
+file_path = '/zhang-x3/users/ml2585/eg_logs/resnet_dist_4_long/resnet_dist_trace_1.json'  # Replace with your JSON file path
 # file_path = '/tmp/tmp_20230530_21b8d82_287757.json'
 dictionary = read_dictionary_from_json(file_path)
 print(dictionary.keys())
@@ -199,6 +236,8 @@ trace_events = dictionary['traceEvents']
 
 analyze_iteration(trace_events)
 analyze_nccl(trace_events)
+
+analyze_top_cpu_ops(trace_events)
 
 exit(1)
 
