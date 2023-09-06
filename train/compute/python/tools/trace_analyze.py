@@ -206,7 +206,6 @@ analyze_top_cpu_ops(trace_events)
 
 exit(1)
 
-
 cuda_runtime = [event for event in trace_events_under_iteration if event['cat'] == 'cuda_runtime']
 # kernels = [event for event in trace_events_under_iteration if event['cat'] == 'kernel']
 kernels = [event for event in trace_events_under_iteration if event['cat'] == 'kernel' or event['cat'] == 'gpu_memset' or event['cat'] == 'gpu_memcpy']
