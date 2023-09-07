@@ -51,6 +51,7 @@ LABEL_MARKERS = [
     "All2All_Pooled_Req",
     "All2All_Pooled_Wait",
     "c10d::",
+    "iter#"
 ]
 
 
