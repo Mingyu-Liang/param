@@ -270,7 +270,6 @@ class commsTraceReplayBench(paramCommsBench):
             None
         """
         super().checkArgs(args)
-
         if (not self.use_remote_trace) and (
             path.exists(self.trace_file) is False
             or path.isfile(self.trace_file) is False
@@ -1043,7 +1042,7 @@ class commsTraceReplayBench(paramCommsBench):
                     curComm.markerStack if curComm.markerStack is not None else []
                 )
                 curBlockStack = (
-                    " ".join(curBlocks) if len(curBlocks) > 0 else "Unamed/Unknown"
+                    " ".join(curBlocks) if len(curBlocks) > 0 else collName
                 )
 
                 if self.backendFuncs.get_global_rank() == 0:

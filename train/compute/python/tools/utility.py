@@ -5,6 +5,8 @@ from typing import Any, Dict
 
 from param_bench.train.compute.python.tools.execution_graph import ExecutionGraph
 
+logger = logging.getLogger(__name__)
+
 
 def get_tmp_trace_filename():
     import datetime
@@ -26,15 +28,15 @@ def get_tmp_trace_filename():
 def trace_handler(prof):
     fn = get_tmp_trace_filename()
     prof.export_chrome_trace("/tmp/" + fn)
-    logging.warning(f"Chrome profile trace written to /tmp/{fn}")
+    logger.info(f"Chrome profile trace written to /tmp/{fn}")
     # try:
     #     from param_bench.train.compute.python.tools.internals import upload_trace
 
     #     upload_trace(fn)
     # except ImportError:
-    #     logging.info("FB internals not present")
+    #     logger.info("FB internals not present")
     # except Exception as e:
-    #     logging.info(f"Upload trace error: {e}")
+    #     logger.error(f"Upload trace error: {e}")
     #     pass
 
 

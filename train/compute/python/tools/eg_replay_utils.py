@@ -1,3 +1,4 @@
+import logging
 import re
 
 import torch
@@ -11,6 +12,8 @@ from param_bench.train.compute.python.workloads.pytorch.split_table_batched_embe
     SplitTableBatchedEmbeddingBagsCodegenOp,
 )
 
+
+logger = logging.getLogger(__name__)
 
 # TODO: Add all torch dtypes to here
 TORCH_DTYPES_RNG = {
@@ -438,7 +441,7 @@ def build_torchscript_func(n):
         cu = torch._C.CompilationUnit()
         func = cu.create_function(n.name, graph)
     except Exception as e:
-        print("TorchScript error: ", n.id, e, input_types, "\n", inputStr)
+        logger.error("TorchScript error: ", n.id, e, input_types, "\n", inputStr)
         return None, None
     return func, output_count
 
@@ -468,6 +471,7 @@ from param_bench.train.compute.python.tools.eg_replay_utils import (
 from param_bench.train.compute.python.tools.execution_graph import ExecutionGraph
 from param_bench.train.compute.python.tools.utility import trace_handler
 
+logger = logging.getLogger(__name__)
 
 print("PyTorch version: ", torch.__version__)
 
@@ -613,7 +617,7 @@ if profile_replay:
             try:
                 run_ops(iter, s1)
             except Exception as e:
-                print(os.getpid(), e)
+                logger.error(os.getpid(), e)
                 exit(1)
             # if {cuda_id} != -1:
             #     torch.cuda.synchronize(torch.device("cuda:{cuda_id}"))
@@ -627,15 +631,15 @@ else:
         try:
             run_ops(iter, s1)
         except Exception as e:
-            print(os.getpid(), e)
+            logger.error(os.getpid(), e)
             exit(1)
         # if {cuda_id} != -1:
         #     torch.cuda.synchronize(torch.device("cuda:{cuda_id}"))
         # else:
         #     torch.cuda.synchronize(torch.device("cuda"))
 
-print("Execution finished!")
-print("Avg execution time per iteration is {{}}ms".format((time.time_ns() - start_ns) / {replay_iter} / 1000000.0))
+logger.info("Execution finished!")
+logger.info("Avg execution time per iteration is {{}}ms".format((time.time_ns() - start_ns) / {replay_iter} / 1000000.0))
 end_time = datetime.now()
 
 try:

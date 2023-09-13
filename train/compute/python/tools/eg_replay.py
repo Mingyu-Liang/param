@@ -54,6 +54,8 @@ sys.path.append('/'.join(comms_package_path))
 import comms_utils
 import commsTraceReplay
 
+logger = logging.getLogger(__name__)
+
 
 class ExgrReplayManager:
     def __init__(self):
@@ -143,7 +145,7 @@ class ExgrReplayManager:
                 add_internal_skip_nodes,
             )
         except ImportError:
-            logging.info("FB internals not present")
+            logger.info("FB internals not present")
         else:
             self.skip_node_names = add_internal_skip_nodes(self.skip_node_names)
             self.parallel_nodes_parents = add_internal_parallel_nodes_parents(
@@ -229,7 +231,7 @@ class ExgrReplayManager:
                         read_remote_trace,
                     )
                 except ImportError:
-                    logging.info("FB internals not present")
+                    logger.error("FB internals not present")
                     exit(1)
                 else:
                     eg_trace, self.trace_file = read_remote_trace(self.args.input)
@@ -248,7 +250,7 @@ class ExgrReplayManager:
         else:
             import os
 
-            print(f"{os.getpid()} is rank{self.comms_env_params['global_rank']}")
+            logger.info(f"Pid {os.getpid()} is rank{self.comms_env_params['global_rank']}")
             self.cuda_id = self.comms_env_params["local_rank"]
             self.cuda = f"cuda:{self.comms_env_params['local_rank']}"
             # Different processes should read different eg traces based on global_rank_id.
@@ -258,7 +260,7 @@ class ExgrReplayManager:
                         read_remote_trace,
                     )
                 except ImportError:
-                    logging.info("FB internals not present")
+                    logger.error("FB internals not present")
                     exit(1)
                 else:
                     eg_trace, self.trace_file = read_remote_trace(
@@ -368,7 +370,7 @@ class ExgrReplayManager:
                             self.actual_skip_nodes_cnt += 1
                         dfs_traverse(child)
                 except Exception as e:
-                    print(f"Graph parse error: {e}, node id: {child.id}")
+                    logger.error(f"Graph parse error: {e}, node id: {child.id}")
                     exit(1)
 
         dfs_traverse(root)
@@ -380,7 +382,7 @@ class ExgrReplayManager:
             self.sorted_nodes = self.sorted_nodes[
                 self.operators_count[1] + 1 : self.operators_count[2]
             ]
-        print("#Operators to replay: ", len(self.sorted_nodes))
+        logger.info(f"#Operators to replay: {len(self.sorted_nodes)}")
         for node in self.sorted_nodes:
             anlayze_node(node)
         self.select_parallel_nodes()
@@ -440,7 +442,7 @@ class ExgrReplayManager:
                     bfs_traverse(child)
 
         bfs_traverse(root)
-        print(
+        logger.info(
             f"Additional allocated {len(self.additional_tensors)} tensors with total size of {self.additional_tensors_size/1024/1024}MB"
         )
 
@@ -602,7 +604,7 @@ class ExgrReplayManager:
                                 self.cpu_tensor.add(replay_t_id)
                     except KeyError:
                         if data_type != "Tensor(nullptr (uninitialized))":
-                            print("KeyError: ", node.id, t_id, data_type)
+                            logger.error("KeyError: ", node.id, t_id, data_type)
                         self.tensor_registry_permanent[replay_t_id] = None
 
             ######
@@ -742,7 +744,7 @@ class ExgrReplayManager:
                             self.tensor_registry_permanent[replay_t_id] = 1
                         except KeyError:
                             if dtype != "Tensor(nullptr (uninitialized))":
-                                print("KeyError: ", node.id, t_id, dtype)
+                                logger.error("KeyError: ", node.id, t_id, dtype)
                             tensor_allocation_str += f"global tensor_{replay_t_id}\n"
                             tensor_allocation_str += f"tensor_{replay_t_id} = None\n"
                             self.tensor_registry_permanent[replay_t_id] = 1
@@ -877,7 +879,7 @@ class ExgrReplayManager:
                 outputs = outputs[:-2]
                 return outputs
             except Exception as e:
-                print("Generate outputs error: ", e, node.id)
+                logger.error("Generate outputs error: ", e, node.id)
                 exit(1)
 
         def _generate_run_ops_str(override):
@@ -1000,7 +1002,7 @@ class ExgrReplayManager:
         )
 
         if self.dump:
-            print(f"Intermediate benchmark file dumped to {self.dump_path}")
+            logger.info(f"Intermediate benchmark file dumped to {self.dump_path}")
             with open(self.dump_path, "w") as f:
                 print(code_str, file=f)
         exec(code_str)
@@ -1078,7 +1080,8 @@ class ExgrReplayManager:
                         inputs.append(item)
             return inputs
         except Exception as e:
-            print(f"Inputs error: {e} at node: {node.id}")
+            logger.error(f"Inputs error: {e} at node: {node.id}")
+            exit(1)
 
     def run_op(self, node, iter):
         if node.name == "record_param_comms" and not self.compute_only:
@@ -1097,12 +1100,12 @@ class ExgrReplayManager:
             # # the original in eg, reshape if different.
             # if type(opTensor) is list:
             #     for t in opTensor:
-            #         print(t)
+            #         logger.error(t)
 
             original_shape = reduce(lambda x, y: x * y, node.output_shapes[0])
             op_tensor_shape = reduce(lambda x, y: x * y, list(opTensor.size()))
             if original_shape != op_tensor_shape:
-                print(
+                logger.error(
                     "Comms ops output tensor shape mismatch: ",
                     node.id,
                     original_shape,
@@ -1163,7 +1166,7 @@ class ExgrReplayManager:
                 # Flatten any tensor lists
                 # TODO: Simplify this
                 if not tmp:
-                    print(f"Not expect that {node.id} has no output.")
+                    logger.error(f"Not expect that {node.id} has no output.")
                     return
                 for x in tmp:
                     if isinstance(x, list) and isinstance(x[0], torch.Tensor):
@@ -1171,7 +1174,7 @@ class ExgrReplayManager:
                     elif isinstance(x, torch.Tensor):
                         outputs.append(x)
         except Exception as e:
-            print(
+            logger.error(
                 f"Run op exception Error: {e}, node id: {node.id}, func: {func}, inputs: {inputs}"
             )
             exit(1)
@@ -1193,7 +1196,7 @@ class ExgrReplayManager:
             if self.tensor_with_device:
                 t_id = tuple(list(t_id)[:5])
             # if output.isnan().any():
-            #     print(
+            #     logger.warning(
             #         node.id,
             #         t_id,
             #         output,
@@ -1232,7 +1235,7 @@ class ExgrReplayManager:
 
     def init_comms(self):
         comms_env_params = comms_utils.read_comms_env_vars()
-        print(comms_env_params, self.cuda)
+        logger.info(f"Distributed environment: {comms_env_params}, with cuda:{self.cuda}")
 
         self.commsBench = commsTraceReplay.commsTraceReplayBench()
         self.commsBench.trace_file = self.trace_file
@@ -1276,13 +1279,13 @@ class ExgrReplayManager:
             elif "record_param_comms" in op:
                 comms_cnt += 1
             else:
-                print(op)
-        print("fused cnt: ", fused_cnt)
-        print("aten unsupported cnt: ", aten_up_cnt)
-        print("aten cnt: ", aten_cnt)
-        print("custom cnt: ", custom_cnt)
-        print("comms cnt: ", comms_cnt)
-        print("skipped ops: ", self.actual_skip_nodes)
+                logger.info(op)
+        logger.info("fused cnt: ", fused_cnt)
+        logger.info("aten unsupported cnt: ", aten_up_cnt)
+        logger.info("aten cnt: ", aten_cnt)
+        logger.info("custom cnt: ", custom_cnt)
+        logger.info("comms cnt: ", comms_cnt)
+        logger.info("skipped ops: ", self.actual_skip_nodes)
 
     def preprocess_graph(self):
         if not self.compute_only and not self.generator:
@@ -1298,7 +1301,7 @@ class ExgrReplayManager:
                     find_subgraph = True
                     break
             if not find_subgraph:
-                print(f"Cannot find subgraph with name {self.subgraph}.")
+                logger.error(f"Cannot find subgraph with name {self.subgraph}.")
                 exit(1)
         else:
             root = nodes[1]  # 1-base
@@ -1317,7 +1320,7 @@ class ExgrReplayManager:
         for tensor in self.tensor_shapes:
             if len(self.tensor_shapes[tensor]) != 1:
                 tensor_with_multiple_shape_count += len(self.tensor_shapes[tensor])
-        print(
+        logger.info(
             f"Tensor count with same identifier but different shapes:{tensor_with_multiple_shape_count}, total tensor: {len(self.tensor_shapes)}"
         )
 
@@ -1332,7 +1335,7 @@ class ExgrReplayManager:
         self.preprocess_graph()
         if self.generator:
             return
-        print("Start execution: ")
+        logger.info("Start execution: ")
         time.sleep(2)
         
         total_time = 0.0
@@ -1370,15 +1373,8 @@ class ExgrReplayManager:
                     if iter == prev_iter:
                         start_ns = time.time_ns()
                     if iter == prev_iter + qps_print_interval:
-                        print(
-                            "Current QPS: ",
-                            int(
-                                self.batch_size
-                                * qps_print_interval
-                                / ((time.time_ns() - start_ns) / 1000000000)
-                            ),
-                        )
-                        print(
+                        logger.info(f"Current QPS: {int(self.batch_size * qps_print_interval / ((time.time_ns() - start_ns) / 1000000000))}")
+                        logger.info(
                             "Replay {} iterations time: {}ms".format(
                                 qps_print_interval,
                                 (time.time_ns() - start_ns) / 1000000.0,
@@ -1390,7 +1386,7 @@ class ExgrReplayManager:
                     for node in self.sorted_nodes:
                         self.run_op(node, iter)
                         # torch.cuda.synchronize(self.device)
-                    print("Finished one iteration.")
+                    logger.info("Finished one iteration.")
                     event_2.record()
                     torch.cuda.synchronize(self.device)
                     if iter >= self.numWarmupIters:
@@ -1398,7 +1394,7 @@ class ExgrReplayManager:
                     # Comment out this for now since it will introduce additional cudaMalloc.
                     # self.reset_registry()
                     prof.step()
-                print("Execution finished!")
+                logger.info("Execution finished!")
         else:
             for iter in range(self.numWarmupIters + self.numIters):
                 if self.eg_profile:
@@ -1410,15 +1406,8 @@ class ExgrReplayManager:
                 if iter == prev_iter:
                     start_ns = time.time_ns()
                 if iter == prev_iter + qps_print_interval:
-                    print(
-                        "Current QPS: ",
-                        int(
-                            self.batch_size
-                            * qps_print_interval
-                            / ((time.time_ns() - start_ns) / 1000000000)
-                        ),
-                    )
-                    print(
+                    logger.info(f"Current QPS: {int(self.batch_size * qps_print_interval / ((time.time_ns() - start_ns) / 1000000000))}")
+                    logger.info(
                         "Replay {} iterations time: {}ms".format(
                             qps_print_interval, (time.time_ns() - start_ns) / 1000000.0
                         )
@@ -1433,10 +1422,10 @@ class ExgrReplayManager:
                 if iter >= self.numWarmupIters:
                     total_time += event_1.elapsed_time(event_2)
                 # self.reset_registry()
-            print("Execution finished!")
+            logger.info("Execution finished!")
 
         if self.profile_memory:
-            print("Allocated GPU memory(B):")
+            logger.info("Allocated GPU memory(B):")
             for node in dict(
                 sorted(
                     self.op_allocated_mem.items(),
@@ -1444,18 +1433,18 @@ class ExgrReplayManager:
                     reverse=True,
                 )[:100]
             ):
-                print(node.id, self.op_allocated_mem[node])
-            print("Reserved GPU memory(B):")
+                logger.info(node.id, self.op_allocated_mem[node])
+            logger.info("Reserved GPU memory(B):")
             for node in dict(
                 sorted(
                     self.op_reserved_mem.items(), key=lambda item: item[1], reverse=True
                 )[:100]
             ):
-                print(node.id, self.op_reserved_mem[node])
+                logger.info(node.id, self.op_reserved_mem[node])
 
-        print("Replay time per iteration: {:.2f} ms".format(total_time / self.numIters))
+        logger.info("Replay time per iteration: {:.2f} ms".format(total_time / self.numIters))
 
-        print(
+        logger.info(
             "Operator coverage: {} / {} = {}".format(
                 len(self.sorted_nodes),
                 len(self.sorted_nodes) + self.actual_skip_nodes_cnt,
@@ -1470,20 +1459,20 @@ class ExgrReplayManager:
                 generate_query_url,
             )
         except ImportError:
-            logging.info("FB internals not present")
+            logger.info("FB internals not present")
         else:
             generate_query_url(start_time, end_time, self.cuda_id)
 
         if self.debug:
-            print("Setup time: {}".format(sum(self.setup_time) / 1000000.0))
-            print("Execution time: {}".format(sum(self.exec_time) / 1000000.0))
+            logger.info("Setup time: {}".format(sum(self.setup_time) / 1000000.0))
+            logger.info("Execution time: {}".format(sum(self.exec_time) / 1000000.0))
 
-            print("Input time: {}".format(self.input_total_time / 1000000.0))
-            print("Output time: {}".format(self.output_total_time / 1000000.0))
-            print("Lookup count: {}".format(self.lookup_cnt))
-            print("Remap tensor list size: ", len(self.tensors_mapping))
+            logger.info("Input time: {}".format(self.input_total_time / 1000000.0))
+            logger.info("Output time: {}".format(self.output_total_time / 1000000.0))
+            logger.info("Lookup count: {}".format(self.lookup_cnt))
+            logger.info("Remap tensor list size: ", len(self.tensors_mapping))
 
-            print(
+            logger.info(
                 "Execution time: 50th:{}ms\t90th:{}ms\t95th:{}ms".format(
                     np.percentile(self.exec_time, 50) / 1000.0,
                     np.percentile(self.exec_time, 90) / 1000.0,
@@ -1629,7 +1618,16 @@ class ExgrReplayManager:
             default=True,
             help="when a eg_id is being replayed multiple times, setting this to false will use temsors from previous runs.",
         )
+        parser.add_argument(
+            "--log-level",
+            type=str,
+            default="INFO",
+            help="Logging level",
+            choices=["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"],
+        )
         self.args, _ = parser.parse_known_args()
+        numeric_level = getattr(logging, self.args.log_level.upper(), None)
+        logger.setLevel(numeric_level)
 
 
 def main():
