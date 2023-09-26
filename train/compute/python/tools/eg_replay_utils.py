@@ -365,12 +365,29 @@ def generate_fbgemm_tensors(n, device, rows_per_table, pooling_factor, alpha):
     return input_args, input_kwargs  # Discard weights if not needed
 
 
+def find_custom_ops(op_name):
+    from transformer_engine import pytorch as te
+    # Replace the path to your own .so file.
+    torch.ops.load_library("/zhang-x3/users/ml2585/.conda/envs/te3/lib/python3.11/site-packages/libtransformer_engine.so")
+
+    # Assume that the format of the operator is xxx::xxx
+    splits = op_name.split('::')
+    if len(splits) != 2:
+        logger.error("Unexpected op format error: ", op_name)
+        return None
+    
+    return getattr(getattr(torch.ops, splits[0]), splits[1])
+
+
 def build_torchscript_func(n):
     input_count = len(n.input_types)
     output_count = len(n.output_types)
 
-    if n.op_schema == "" or n.name == "aten::record_stream" or n.name.startswith("aten::_foreach") or n.name.startswith("tex_ts::"):
+    if n.op_schema == "" or n.name == "aten::record_stream" or n.name.startswith("aten::_foreach"):
         return None, None
+
+    if "::" in n.name and n.name.split("::")[0] != "aten":
+        return find_custom_ops(n.name), output_count
 
     tmp = n.op_schema.split(") -> ")
     # items = [item for item in tmp[0].split(',') if item != ' *']
