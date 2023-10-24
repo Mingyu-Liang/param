@@ -8,7 +8,7 @@ The general motivation and design philosophy for the new microbenchmarks are:
 * Decoupled workload configuration from Python code. It allows building tools in a pipeline to collect operator configuration from production runs, generate microbenchmark inputs, gather metrics.
 * Generates human readable and easy to parse output data format for downstream tools.
 * A library interface allowing external tools to run and collect data results from the microbenchmarks.
-* Support replay of workload through PyTorch execution graph.
+* Support replay of workload through PyTorch execution trace.
 
 For design and implementation details or make a contribution to the project, please look at the [development documentation](development.md).
 
@@ -31,6 +31,8 @@ We use `setuptools` to install/uninstall the `parambench-train-compute` package:
 The installed packages are under **`param_bench.train.compute.python`**.
 
 To use the [`FBGEMM_GPU`](https://github.com/pytorch/FBGEMM/tree/main/fbgemm_gpu) library and its operator benchmark workload ([`split_table_batched_embeddings_ops.py`](workloads/pytorch/split_table_batched_embeddings_ops.py)), please follow its set up instruction to download and install. It's not required for the compute benchmarks. During initialization, if an operator fail to import, it'll be ignored and will not affect other benchmarks.
+
+Please make sure to install the `parambench-train-comms` package (`train/comms/pt`). This is important because some functions in this package reference those in the comms package.
 
 ## Usage
 The bundled tool scripts such as [`run_benchmark.py`](pytorch/run_benchmark.py) are written using relative import paths as part of the `parambench-train-compute` package, so they must be ran as a module using the `python -m` option.

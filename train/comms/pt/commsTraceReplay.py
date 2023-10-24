@@ -8,17 +8,16 @@
 from __future__ import absolute_import, division, print_function, unicode_literals
 
 import argparse
-import copy
 import json
 import logging
 import time
 from os import path
 from typing import Dict, List, Set
 
-import comms_utils
 import numpy as np
 import torch
-from comms_utils import (
+from param_bench.train.comms.pt import comms_utils
+from param_bench.train.comms.pt.comms_utils import (
     bootstrap_info_holder,
     commsArgs,
     commsParamsHolderBase,
@@ -26,12 +25,19 @@ from comms_utils import (
     paramStreamGuard,
     paramToCommName,
 )
-from param_profile import paramProfile, paramTimer
+from param_bench.train.comms.pt.param_profile import paramProfile, paramTimer
+
+try:
+    from trainer_iteration_wrapper import setTrainingIteration  # @manual
+except ImportError:
+    pass
 
 logger = logging.getLogger(__name__)
 
 # sleep for 20ms to wait for next collective
 LOOP_TIMER_S = 0.02
+
+VALID_TRACE_TYPES = ["basic", "et", "kineto"]
 
 
 def writeCommDetails(commsTracePerf: List, rank: int, folder: str = "./") -> None:
@@ -56,7 +62,10 @@ def writeCommDetails(commsTracePerf: List, rank: int, folder: str = "./") -> Non
     if "://" in comms_file:  # assume that "://" in directory path means remote store
         saveToLocal = False
         try:
-            from internals import writeRemoteTrace as writeFbRemoteTrace
+            from param_bench.train.comms.pt.fb.internals import (
+                writeRemoteTrace as writeFbRemoteTrace,
+            )
+
         except ImportError:
             saveToLocal = True
             pass
@@ -90,6 +99,7 @@ class commsTraceReplayBench(paramCommsBench):
         super().__init__(supportedNwstacks=["pytorch-dist", "pytorch-xla-tpu"])
         self.comms_trace = {}
         self.trace_file = ""
+        self.trace_type = ""
         self.use_remote_trace = False
         self.use_one_trace = False
         self.disable_parallel_read = False
@@ -134,7 +144,7 @@ class commsTraceReplayBench(paramCommsBench):
         # how long it took to finish all collectives in the trace
         self.totalTraceLatency = 0.0
 
-        self.eg_to_tensors = {}
+        self.et_to_tensors = {}
 
         self.gemmTensor = None
 
@@ -156,6 +166,12 @@ class commsTraceReplayBench(paramCommsBench):
             type=str,
             default="./",
             help="File path to read the trace. All rank read their own trace file unless `--use-one-trace` is used.",
+        )
+        parser.add_argument(
+            "--trace-type",
+            type=str,
+            default="basic",
+            help=f"Trace type used for replay. Supported trace types: {str(VALID_TRACE_TYPES)}. By default use basic trace.",
         )
         parser.add_argument(
             "--use-one-trace",
@@ -281,6 +297,11 @@ class commsTraceReplayBench(paramCommsBench):
         if args.disable_parallel_read and not args.use_one_trace:
             raise ValueError(
                 "--disable-parallel-read is valid only when --use-one-trace is used."
+            )
+            comms_utils.gracefulExit()
+        if args.trace_type not in VALID_TRACE_TYPES:
+            raise ValueError(
+                f"Trace type {self.trace_type} is not valid! Please specify one supported trace type from {str(VALID_TRACE_TYPES)} by using --trace-type."
             )
             comms_utils.gracefulExit()
 
@@ -631,13 +652,13 @@ class commsTraceReplayBench(paramCommsBench):
         if regenerateTensors:
             return super().prepComm(curComm, commsParams)
         else:
-            if curComm.id in self.eg_to_tensors:
+            if curComm.id in self.et_to_tensors:
                 # Allocate input/output tensors if first time replay, otherwise the previous ones.
                 super().prepComm(curComm, commsParams, False)
-                (ipTensor, opTensor) = self.eg_to_tensors[curComm.id]
+                (ipTensor, opTensor) = self.et_to_tensors[curComm.id]
             else:
                 (ipTensor, opTensor) = super().prepComm(curComm, commsParams, True)
-                self.eg_to_tensors[curComm.id] = (ipTensor, opTensor)
+                self.et_to_tensors[curComm.id] = (ipTensor, opTensor)
         return (ipTensor, opTensor)
 
     def commRebalance(self, curComm: commsArgs) -> None:
@@ -933,7 +954,7 @@ class commsTraceReplayBench(paramCommsBench):
 
                 # Running the kernel
                 logger.info(
-                    f"{logLable}[Rank {self.collectiveArgs.global_rank:3}] [{cnt} / {self.max_msg_cnt}] Replaying {curComm.compute}"
+                    f"{logLable}[Rank {self.collectiveArgs.global_rank:3}] [{cnt+1} / {self.max_msg_cnt}] Replaying {curComm.compute}"
                 )
 
                 # Run the kernel and report the total time
@@ -956,8 +977,12 @@ class commsTraceReplayBench(paramCommsBench):
 
                 if groupRank == 0:
                     commDesc = f"{str(curComm.comms)}: NumElemsIn={curComm.inMsgSize}, NumElemsOut={curComm.outMsgSize}, Dtype={curComm.dtype}"
+                    if curComm.comms == "all_to_allv":
+                        commDesc += (
+                            f", InSplit={curComm.inSplit}, OutSplit={curComm.outSplit}"
+                        )
                     logger.info(
-                        f"{logLable}[Rank {self.collectiveArgs.global_rank:3}] [{cnt} / {self.max_msg_cnt}] Replaying {commDesc} with {groupDesc}"
+                        f"{logLable}[Rank {self.collectiveArgs.global_rank:3}] [{cnt+1} / {self.max_msg_cnt}] Replaying {commDesc} with {groupDesc}"
                     )
 
                 # read fields and prepare the tensors
@@ -1018,8 +1043,64 @@ class commsTraceReplayBench(paramCommsBench):
 
             if self.backendFuncs.get_global_rank() == 0:
                 logger.info(
-                    f"{logLable}[{cnt} / {self.max_msg_cnt}] Replayed {recordName} in block [{curBlockStack}]... {global_latency:.2f} us"
+                    f"{logLable}[{cnt+1} / {self.max_msg_cnt}] Replayed {recordName} in block [{curBlockStack}]... {global_latency:.2f} us"
                 )
+
+    def replaySingle(
+        self, commsParams: commsParamsHolderBase, id: int, regenerateTensors: True
+    ) -> torch.tensor:
+        """
+        Replay comms trace.
+        Args:
+            commsParams: Run-time parameters for replay.
+            id: comms op id.
+        Returns:
+            Output tensor.
+        """
+        for _, curComm in enumerate(self.comms_trace[: self.max_msg_cnt]):
+            if curComm.id == id:
+                collName = paramToCommName(curComm.comms)
+                if collName not in self.allowList:
+                    return
+
+                curBlocks = (
+                    curComm.markerStack if curComm.markerStack is not None else []
+                )
+                curBlockStack = (
+                    " ".join(curBlocks) if len(curBlocks) > 0 else "Unamed/Unknown"
+                )
+
+                if self.backendFuncs.get_global_rank() == 0:
+                    logger.debug(
+                        f"[Rank {self.collectiveArgs.global_rank:3}] Replaying \n{str(curComm.comms)}\n"
+                    )
+
+                # read fields and prepare the tensors
+                (
+                    self.collectiveArgs.ipTensor,
+                    self.collectiveArgs.opTensor,
+                ) = self.prepComms(curComm, commsParams, regenerateTensors)
+
+                # send comm request to pytorch backend
+                (latency, global_latency) = self.runComms(
+                    collName, curComm, curBlockStack
+                )
+
+                # perform data validation check on the final opTensor
+                if (
+                    self.is_blocking
+                    and commsParams.dcheck == 1
+                    and collName not in ("wait", "barrier")
+                ):
+                    commsParams.collective = collName
+                    commsParams.srcOrDst = (
+                        curComm.root if curComm.root is not None else 0
+                    )
+                    self.dcheck(
+                        commsParams, curComm.outMsgSize, self.collectiveArgs.opTensor
+                    )
+
+                return self.collectiveArgs.opTensor
 
     def replaySingle(
         self, commsParams: commsParamsHolderBase, id: int, regenerateTensors: True
@@ -1169,6 +1250,12 @@ class commsTraceReplayBench(paramCommsBench):
             if self.collectiveArgs.enable_profiler:
                 comms_utils.sampleProfiler()
 
+            # set training iteration number in NCCL
+            try:
+                setTrainingIteration(i + 1)
+            except NameError:
+                pass
+
             # replay comms trace
             self.replayIter = i
             self.replayTrace(commsParams=commsParams, warmup=False)
@@ -1210,7 +1297,9 @@ class commsTraceReplayBench(paramCommsBench):
         """
 
         global_rank = self.backendFuncs.get_global_rank()
-        logger.info(f"[Rank-{global_rank}] reading trace from {self.trace_file}")
+        logger.info(
+            f"[Rank-{global_rank}] reading {self.trace_type} trace from {self.trace_file}"
+        )
         self.report = (
             True
             if global_rank == 0
@@ -1288,11 +1377,13 @@ class commsTraceReplayBench(paramCommsBench):
         """
         # init backend and corresponding function pointers
         if commsParams.nw_stack == "pytorch-dist":
-            from pytorch_dist_backend import PyTorchDistBackend
+            from param_bench.train.comms.pt.pytorch_dist_backend import (
+                PyTorchDistBackend,
+            )
 
             self.backendFuncs = PyTorchDistBackend(bootstrap_info, commsParams)
         elif commsParams.nw_stack == "pytorch-xla-tpu":
-            from pytorch_tpu_backend import PyTorchTPUBackend
+            from param_bench.train.comms.pt.pytorch_tpu_backend import PyTorchTPUBackend
 
             self.backendFuncs = PyTorchTPUBackend(bootstrap_info, commsParams)
         else:
@@ -1399,6 +1490,7 @@ class commsTraceReplayBench(paramCommsBench):
     def setTraceFile(self, args, comms_env_params):
         # TODO: file name may get changed later
         self.trace_file = args.trace_path
+        self.trace_type = args.trace_type
         # assume the prefix is always "xxx://" when reading remote trace, e.g., http://xxx
         if "://" in args.trace_path:
             self.use_remote_trace = True
@@ -1420,7 +1512,10 @@ class commsTraceReplayBench(paramCommsBench):
                 raw_comms_trace = comms_utils.commonUrlRead(remotePath=remotePath)
             else:
                 try:
-                    from internals import readRemoteTrace as readFbRemoteTrace
+                    from param_bench.train.comms.pt.fb.internals import (
+                        readRemoteTrace as readFbRemoteTrace,
+                    )
+
                 except ImportError:
                     logger.error(
                         f"Not supported protocol for the URL provided {remotePath}"
@@ -1430,6 +1525,7 @@ class commsTraceReplayBench(paramCommsBench):
                         remotePath=remotePath,
                         rank=rank,
                         full_trace_path=self.use_one_trace,
+                        trace_type=self.trace_type,
                     )
 
             self.comms_trace = json.load(raw_comms_trace)
@@ -1471,19 +1567,22 @@ class commsTraceReplayBench(paramCommsBench):
 
         # Convert trace to comms trace.
         try:
-            import commsTraceParser
+            from param_bench.train.comms.pt import commsTraceParser
         except ImportError:
             logger.info("FB internals not present, using base parser.")
             self.comms_trace = extractCommsInfo(self.comms_trace)
         else:
             self.comms_trace = commsTraceParser.parseTrace(
-                self.comms_trace, self.global_rank
+                self.comms_trace,
+                self.trace_type,
+                rank,
+                self.backendFuncs.get_world_size(),
             )
 
 
 def extractCommsInfo(in_trace: List[Dict]) -> List[commsArgs]:
     """
-    Convert UCC Trace to comms trace format.
+    Convert Basic Trace to comms trace format.
     """
     # print("in extract comms info")
     # exit(1)

@@ -1,4 +1,7 @@
+fbgemm_gpu
 gitpython
 networkx
 numpy
-torch>=1.12
+pydot
+scipy
+torch>=2.0.0

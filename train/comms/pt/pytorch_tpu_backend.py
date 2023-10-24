@@ -128,6 +128,11 @@ class PyTorchTPUBackend(backendFunctions):
     ):
         return xm.get_local_ordinal()
 
+    def get_local_size(
+        self,
+    ):
+        return self.bootstrap_info.local_size
+
     def get_global_rank(
         self,
     ):
@@ -156,6 +161,10 @@ class PyTorchTPUBackend(backendFunctions):
 
     def get_num_pgs(self):
         pass
+
+    def tensor_list_to_numpy(self, tensorList):
+        tensorList = torch.transpose(tensorList.view(-1, 1), 0, 1)[0]
+        return tensorList.cpu().detach().numpy()
 
     # Init functions
     def __init__(self, bootstrap_info, commsParams):

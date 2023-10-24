@@ -9,7 +9,7 @@ from typing import Dict, List, Optional
 
 import torch
 
-from param_profile import paramTimer
+from param_bench.train.comms.pt.param_profile import paramTimer
 
 from torch.distributed import ProcessGroup
 
@@ -141,6 +141,8 @@ class backendFunctions(ABC):
             "multicast": self.multicast,
             "noop": self.noop,
         }
+
+        self.computeFunc = {"gemm": self.gemm}
 
     def getBusBW(
         self, collective: str, algBW: float, collectiveArgs: collectiveArgsHolder
@@ -309,6 +311,10 @@ class backendFunctions(ABC):
 
     @abstractmethod
     def get_world_size(self) -> int:
+        pass
+
+    @abstractmethod
+    def get_local_size(self) -> int:
         pass
 
     @abstractmethod

@@ -1,18 +1,18 @@
+import datetime
 import gzip
 import json
 import logging
+import os
+import uuid
 from typing import Any, Dict
 
-from param_bench.train.compute.python.tools.execution_graph import ExecutionGraph
+from param_bench.train.compute.python.tools.execution_trace import ExecutionTrace
 
 logger = logging.getLogger(__name__)
 
 
-def get_tmp_trace_filename():
-    import datetime
-    import os
-    import uuid
-
+def get_tmp_trace_filename() -> str:
+    """Generate a temporary filename using the current date, a UUID, and the process ID."""
     trace_fn = (
         "tmp_"
         + datetime.datetime.today().strftime("%Y%m%d")
@@ -25,29 +25,32 @@ def get_tmp_trace_filename():
     return trace_fn
 
 
-def trace_handler(prof):
+def trace_handler(prof: Any) -> None:
+    """Export a chrome trace"""
     fn = get_tmp_trace_filename()
     prof.export_chrome_trace("/tmp/" + fn)
     logger.info(f"Chrome profile trace written to /tmp/{fn}")
-    # try:
-    #     from param_bench.train.compute.python.tools.internals import upload_trace
-
-    #     upload_trace(fn)
-    # except ImportError:
-    #     logger.info("FB internals not present")
-    # except Exception as e:
-    #     logger.error(f"Upload trace error: {e}")
-    #     pass
 
 
-def load_execution_trace_file(et_file_path: str) -> ExecutionGraph:
+def load_execution_trace_file(et_file_path: str) -> ExecutionTrace:
     """Loads Execution Trace from json file and parses it."""
     data = read_dictionary_from_json_file(et_file_path)
-    return ExecutionGraph(data)
+    return ExecutionTrace(data)
 
 
 def read_dictionary_from_json_file(file_path: str) -> Dict[Any, Any]:
+    """Read a json file and return it as a dictionary."""
     with gzip.open(file_path, "rb") if file_path.endswith("gz") else open(
         file_path, "r"
     ) as f:
         return json.load(f)
+
+
+def write_dictionary_to_json_file(file_path: str, data: Dict[Any, Any]) -> None:
+    """Write input dictionary to a json file."""
+    if file_path.endswith("gz"):
+        with gzip.open(file_path, "w") as f:
+            f.write(json.dumps(data, indent=4).encode("utf-8"))
+    else:
+        with open(file_path, "w") as f:
+            json.dump(data, f, indent=4)

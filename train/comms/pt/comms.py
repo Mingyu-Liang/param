@@ -11,19 +11,29 @@ import argparse
 import logging
 import time
 
-import comms_utils
 import numpy as np
 
 # pytorch
 import torch
-from comms_utils import (
+
+from param_bench.train.comms.pt import comms_utils
+from param_bench.train.comms.pt.comms_utils import (
     bootstrap_info_holder,
     commsParamsHolderBase,
     ensureTensorFlush,
     paramCommsBench,
+    paramDeviceTimer,
     paramStreamGuard,
 )
-from pytorch_backend_utils import (
+from param_bench.train.comms.pt.logger_utils import (
+    benchType,
+    commsCollPerfMetrics,
+    commsPt2PtPerfMetrics,
+    commsQuantCollPerfMetrics,
+    customized_perf_loggers,
+)
+
+from param_bench.train.comms.pt.pytorch_backend_utils import (
     pt2ptPatterns,
     supportedC10dBackends,
     supportedCollectives,
@@ -130,7 +140,7 @@ class commsCollBench(paramCommsBench):
             type=str,
             default="gemm",
             help="Compute kernel, used for comms-compute or compute mode",
-            choices=["gemm", "emb_lookup"],
+            choices=["gemm", "emb_lookup", "add", "sub", "add_num", "sub_num", "copy"],
         )  # Compute kernel: "gemm"
         parser.add_argument(
             "--num-compute",
@@ -149,9 +159,10 @@ class commsCollBench(paramCommsBench):
         # For GEMM
         parser.add_argument(
             "--mm-dim",
+            "--comp-dim",
             type=int,
             default=100,
-            help="dimension size for GEMM compute kernel",
+            help="dimension size for GEMM or other compute kernels except emb_lookup",
         )  # Matrix multiplication dim n, A[n,n] * B [n,n]
         # For emb lookup
         parser.add_argument(
@@ -258,7 +269,6 @@ class commsCollBench(paramCommsBench):
             default=None,
             help="customized tag or keyword to be added into final output lines",
         )  # execute pytorch profiler at specified size if applicable
-
         return parser.parse_known_args()
 
     def _checkPt2Pt(self, args):
@@ -458,6 +468,10 @@ class commsCollBench(paramCommsBench):
                 elapsedTimeNS = 0.0
                 self.collectiveArgs.quant_time.reset()
                 self.collectiveArgs.dequant_time.reset()
+                if self.collectiveArgs.comm_dev_time:
+                    self.collectiveArgs.comm_dev_time.reset()
+                if self.collectiveArgs.compute_dev_time:
+                    self.collectiveArgs.compute_dev_time.reset()
             # reset tensor values for data validation check
             if enable_comms and dcheck:
                 self.setTensorVal(self.collectiveArgs.opTensor)
@@ -466,18 +480,29 @@ class commsCollBench(paramCommsBench):
                 self.backendFuncs.sync_barrier(self.collectiveArgs)
 
             start = time.monotonic()  # available only in py3
-            for _ in range(self.collectiveArgs.numCollPerIter):
-                self.collectiveArgs.group = self.backendFuncs.get_next_group()
-                comm_fn(self.collectiveArgs)
-                # post another collecitve if on comms pair mode, otherwise it's noop
-                self.collectiveArgs.group = self.backendFuncs.get_next_group()
-                comm_fn_pair(self.collectiveArgs, pair=enable_comms_pair)
+            with paramStreamGuard(
+                stream=self.backendFuncs.get_current_stream(
+                    device=self.collectiveArgs.device
+                ),
+                curDevice=self.collectiveArgs.device,
+                backendFuncs=self.backendFuncs,
+                timer=self.collectiveArgs.comm_dev_time,
+                is_blocking=False,
+            ):
+                for _ in range(self.collectiveArgs.numCollPerIter):
+                    self.collectiveArgs.group = self.backendFuncs.get_next_group()
+                    comm_fn(self.collectiveArgs)
+                    # post another collecitve if on comms pair mode, otherwise it's noop
+                    self.collectiveArgs.group = self.backendFuncs.get_next_group()
+                    comm_fn_pair(self.collectiveArgs, pair=enable_comms_pair)
 
             if enable_compute:
                 with paramStreamGuard(
                     stream=self.collectiveArgs.compute_stream,
                     curDevice=self.collectiveArgs.device,
                     backendFuncs=self.backendFuncs,
+                    timer=self.collectiveArgs.compute_dev_time,
+                    is_blocking=False,
                 ):
                     for _ in range(self.collectiveArgs.numComputePerIter):
                         # TODO: investigate the cache effect
@@ -486,6 +511,12 @@ class commsCollBench(paramCommsBench):
                         compute_fn(self.collectiveArgs)
             if is_blocking:  # should be sychronous, wait for the collective
                 self.backendFuncs.complete_accel_ops(self.collectiveArgs)
+                # caputure per-op kernel time only for blocking case
+                if self.collectiveArgs.comm_dev_time:
+                    self.collectiveArgs.comm_dev_time.elapsedTime()
+                if enable_compute and self.collectiveArgs.compute_dev_time:
+                    self.collectiveArgs.compute_dev_time.elapsedTime()
+
             # Measuring time.
             elapsedTimeNS += (
                 time.monotonic() - start
@@ -647,6 +678,7 @@ class commsCollBench(paramCommsBench):
         # get unidirectional bandwidth
         uniLatencyNS = []
         for _ in range(numIters):
+            p2pReqs = []
             self.backendFuncs.sync_barrier(self.collectiveArgs)
             start = time.monotonic()
             for w in range(self.collectiveArgs.window):
@@ -654,16 +686,28 @@ class commsCollBench(paramCommsBench):
                     idx = self.collectiveArgs.src_ranks.index(
                         self.collectiveArgs.global_rank
                     )
-                    self.backendFuncs.isend(
-                        self.collectiveArgs, self.collectiveArgs.dst_ranks[idx], tag=w
+                    p2pReqs.append(
+                        self.backendFuncs.P2POp(
+                            opType="send",
+                            collectiveArgs=self.collectiveArgs,
+                            peer=self.collectiveArgs.dst_ranks[idx],
+                            tag=w,
+                        )
                     )
                 elif self.collectiveArgs.global_rank in self.collectiveArgs.dst_ranks:
                     idx = self.collectiveArgs.dst_ranks.index(
                         self.collectiveArgs.global_rank
                     )
-                    self.backendFuncs.irecv(
-                        self.collectiveArgs, self.collectiveArgs.src_ranks[idx], tag=w
+                    p2pReqs.append(
+                        self.backendFuncs.P2POp(
+                            opType="recv",
+                            collectiveArgs=self.collectiveArgs,
+                            peer=self.collectiveArgs.src_ranks[idx],
+                            tag=w,
+                        )
                     )
+            self.backendFuncs.batch_isend_irecv(p2pReqs, self.collectiveArgs)
+
             self.backendFuncs.complete_accel_ops(self.collectiveArgs)
             uniLatencyNS.append(
                 (time.monotonic() - start) * 1e9
@@ -685,6 +729,7 @@ class commsCollBench(paramCommsBench):
         # get bidirectional bandwidth
         biLatencyNS = []
         for _ in range(numIters):
+            p2pReqs = []
             self.backendFuncs.sync_barrier(self.collectiveArgs)
             start = time.monotonic()
             for w in range(self.collectiveArgs.window):
@@ -692,26 +737,43 @@ class commsCollBench(paramCommsBench):
                     idx = self.collectiveArgs.src_ranks.index(
                         self.collectiveArgs.global_rank
                     )
-                    self.backendFuncs.isend(
-                        self.collectiveArgs, self.collectiveArgs.dst_ranks[idx], tag=w
+                    p2pReqs.append(
+                        self.backendFuncs.P2POp(
+                            opType="send",
+                            collectiveArgs=self.collectiveArgs,
+                            peer=self.collectiveArgs.dst_ranks[idx],
+                            tag=w,
+                        )
                     )
-                    self.backendFuncs.irecv(
-                        self.collectiveArgs,
-                        self.collectiveArgs.dst_ranks[idx],
-                        tag=w + self.collectiveArgs.window,
+                    p2pReqs.append(
+                        self.backendFuncs.P2POp(
+                            opType="recv",
+                            collectiveArgs=self.collectiveArgs,
+                            peer=self.collectiveArgs.dst_ranks[idx],
+                            tag=w + self.collectiveArgs.window,
+                        )
                     )
                 elif self.collectiveArgs.global_rank in self.collectiveArgs.dst_ranks:
                     idx = self.collectiveArgs.dst_ranks.index(
                         self.collectiveArgs.global_rank
                     )
-                    self.backendFuncs.irecv(
-                        self.collectiveArgs, self.collectiveArgs.src_ranks[idx], tag=w
+                    p2pReqs.append(
+                        self.backendFuncs.P2POp(
+                            opType="recv",
+                            collectiveArgs=self.collectiveArgs,
+                            peer=self.collectiveArgs.src_ranks[idx],
+                            tag=w,
+                        )
                     )
-                    self.backendFuncs.isend(
-                        self.collectiveArgs,
-                        self.collectiveArgs.src_ranks[idx],
-                        tag=w + self.collectiveArgs.window,
+                    p2pReqs.append(
+                        self.backendFuncs.P2POp(
+                            opType="send",
+                            collectiveArgs=self.collectiveArgs,
+                            peer=self.collectiveArgs.src_ranks[idx],
+                            tag=w + self.collectiveArgs.window,
+                        )
                     )
+            self.backendFuncs.batch_isend_irecv(p2pReqs, self.collectiveArgs)
             self.backendFuncs.complete_accel_ops(self.collectiveArgs)
             biLatencyNS.append(
                 (time.monotonic() - start) * 1e9
@@ -880,6 +942,35 @@ class commsCollBench(paramCommsBench):
                         f"[Rank {global_rank:>3}] mode: {commsParams.mode}, num_coll: {commsParams.num_coll}, kernel: {commsParams.kernel}, num_compute {commsParams.num_compute}, "
                         f"emb_dim {commsParams.emb_dim}, num_embs {commsParams.num_embs}, batch_size {commsParams.batch_size}"
                     )
+            elif commsParams.kernel in ["add", "sub", "add_num", "sub_num", "copy"]:
+                (
+                    self.collectiveArgs.compOut,
+                    self.collectiveArgs.compIn1,
+                    self.collectiveArgs.compIn2,
+                ) = self.prepComp(
+                    commsParams.mm_dim,
+                    commsParams.dtype,
+                    curDevice,
+                    commsParams.kernel,
+                )
+                computeFunc = self.backendFuncs.computeFunc[commsParams.kernel]
+                if self.report:
+                    print(
+                        f"[Rank {global_rank:>3}] mode: {commsParams.mode}, num_coll: {commsParams.num_coll}, kernel: {commsParams.kernel}, num_compute {commsParams.num_compute}, mm_dim {commsParams.mm_dim}"
+                    )
+
+        # Enable device timer only for comms-compute mode
+        # since CPU timer would capture individual time
+        if commsParams.mode == "comms-compute":
+            self.collectiveArgs.compute_dev_time = paramDeviceTimer(
+                name="compute_timer", backendFuncs=self.backendFuncs
+            )
+            self.collectiveArgs.comm_dev_time = paramDeviceTimer(
+                name="comm_timer", backendFuncs=self.backendFuncs
+            )
+        else:
+            self.collectiveArgs.comm_dev_time = None
+            self.collectiveArgs.compute_dev_time = None
 
         self.backendFuncs.sync_barrier(self.collectiveArgs)
         if self.report:
@@ -940,10 +1031,13 @@ class commsCollBench(paramCommsBench):
         tflops_fmt = ""
         if commsParams.kernel == "gemm" and commsParams.mode != "comms":
             tflops_fmt = "{:>15}"
-
+        dev_time_fmt = ""
+        if commsParams.mode == "comms-compute":
+            dev_time_fmt = "{:>20}{:>20}"
         if self.collectiveArgs.collective == "pt2pt":
             fmt = (
                 "{:>40}{:>20}{:>10}{:>10}{:>25}{:>10}{:>10}{:>15}{:>15}{:>18}{:>18}"
+                + dev_time_fmt
                 + tflops_fmt
             )
             header += fmt.format(
@@ -958,11 +1052,17 @@ class commsCollBench(paramCommsBench):
                 "avgBiBW(GB/s)",
                 "totalUniBW(GB/s)",
                 "totalBiBW(GB/s)",
+                "TotalLatency(us):p50",
+                "CompLatency(us):p50",
                 "TFlops",
             )
         else:
             if commsParams.bitwidth < 32:
-                fmt = "-QUANT\t{:>40}{:>18}{:>25}{:>15}{:>15}{:>15}" + tflops_fmt
+                fmt = (
+                    "-QUANT\t{:>40}{:>18}{:>25}{:>15}{:>15}{:>15}"
+                    + dev_time_fmt
+                    + tflops_fmt
+                )
                 header += fmt.format(
                     "size (B)",
                     "nElementsPerRank",
@@ -970,11 +1070,14 @@ class commsCollBench(paramCommsBench):
                     "Comms",
                     "De-Quant",
                     "Overall",
+                    "TotalLatency(us):p50",
+                    "CompLatency(us):p50",
                     "TFlops",
                 )
             elif not self.collectiveArgs.pair:
                 fmt = (
                     "{:>40}{:>18}{:>18}{:>12}{:>12}{:>12}{:>12}{:>15}{:>12}"
+                    + dev_time_fmt
                     + tflops_fmt
                 )
                 header += fmt.format(
@@ -987,11 +1090,14 @@ class commsCollBench(paramCommsBench):
                     "Max",
                     "AlgBW(GB/s)",
                     "BusBW(GB/s)",
+                    "TotalLatency(us):p50",
+                    "CompLatency(us):p50",
                     "TFlops",
                 )
             else:
                 fmt = (
                     "{:>40}{:>18}{:>22}{:>18}{:>12}{:>12}{:>12}{:>12}{:>15}{:>12}"
+                    + dev_time_fmt
                     + tflops_fmt
                 )
                 header += fmt.format(
@@ -1005,6 +1111,8 @@ class commsCollBench(paramCommsBench):
                     "Max",
                     "AlgBW(GB/s)",
                     "BusBW(GB/s)",
+                    "TotalLatency(us):p50",
+                    "CompLatency(us):p50",
                     "TFlops",
                 )
 
@@ -1018,27 +1126,15 @@ class commsCollBench(paramCommsBench):
         quantTimeTensorList,
         dequantTimeTensorList,
     ):
-        if commsParams.backend == "xla":
-            latencyAcrossRanks = torch.transpose(tensorList.view(-1, 1), 0, 1)[0]
-            latencyAcrossRanks = latencyAcrossRanks.cpu().detach().numpy()
-            # quant tensor
-            quantLatencyAcrossRanks = torch.transpose(
-                quantTimeTensorList.view(-1, 1), 0, 1
-            )[0]
-            quantLatencyAcrossRanks = quantLatencyAcrossRanks.cpu().detach().numpy()
-            # dequant tensor
-            dequantLatencyAcrossRanks = torch.transpose(
-                dequantTimeTensorList.view(-1, 1), 0, 1
-            )[0]
-            dequantLatencyAcrossRanks = dequantLatencyAcrossRanks.cpu().detach().numpy()
-        else:
-            if isinstance(tensorList, list):
-                tensorList = [t.cpu().detach().numpy() for t in tensorList]
-            latencyAcrossRanks = np.array(tensorList)
-            # quant tensor
-            quantLatencyAcrossRanks = np.array(quantTimeTensorList)
-            # dequant tensor
-            dequantLatencyAcrossRanks = np.array(dequantTimeTensorList)
+        latencyAcrossRanks = self.backendFuncs.tensor_list_to_numpy(tensorList)
+        # quant tensor
+        quantLatencyAcrossRanks = self.backendFuncs.tensor_list_to_numpy(
+            quantTimeTensorList
+        )
+        # dequant tensor
+        dequantLatencyAcrossRanks = self.backendFuncs.tensor_list_to_numpy(
+            dequantTimeTensorList
+        )
 
         p95 = np.percentile(latencyAcrossRanks, 95)
 
@@ -1061,6 +1157,22 @@ class commsCollBench(paramCommsBench):
             )
         )
 
+        return commsQuantCollPerfMetrics(
+            self.collectiveArgs.collective,
+            self.collectiveArgs.data_type,
+            benchType.Collective,
+            commsParams.backend,
+            self.tag,
+            results["memSize"],
+            results["memSize"],
+            results["numElements"],
+            results["numElements_pair"] if "numElements_pair" in results else 0,
+            float(quant_p95),
+            float(p95 - quant_p95 - dequant_p95),
+            float(dequant_p95),
+            float(p95),
+        )
+
     def reportBenchTime(
         self,
         commsParams,
@@ -1068,6 +1180,8 @@ class commsCollBench(paramCommsBench):
         tensorList,
         quantTimeTensorList,
         dequantTimeTensorList,
+        commUsElapsedList,
+        computeUsElapsedList,
     ):
         # convernt num_elements to # of elements per rank
         if commsParams.collective in (
@@ -1084,10 +1198,12 @@ class commsCollBench(paramCommsBench):
                 results["numElements"] // self.backendFuncs.get_world_size()
             )
 
+        perf_metrics = None
+
         if commsParams.collective == "pt2pt":
-            self.reportBenchTimePt2Pt(commsParams, tensorList, results)
+            perf_metrics = self.reportBenchTimePt2Pt(commsParams, tensorList, results)
         elif commsParams.bitwidth < 32:
-            self.reportBenchTimeCollWithQuant(
+            perf_metrics = self.reportBenchTimeCollWithQuant(
                 commsParams,
                 results,
                 tensorList,
@@ -1095,18 +1211,42 @@ class commsCollBench(paramCommsBench):
                 dequantTimeTensorList,
             )
         else:
-            self.reportBenchTimeColl(commsParams, results, tensorList)
+            perf_metrics = self.reportBenchTimeColl(
+                commsParams,
+                results,
+                tensorList,
+                commUsElapsedList,
+                computeUsElapsedList,
+            )
 
-    def reportBenchTimeColl(self, commsParams, results, tensorList):
-        if commsParams.backend == "xla":
-            latencyAcrossRanks = torch.transpose(tensorList.view(-1, 1), 0, 1)[0]
-            latencyAcrossRanks = latencyAcrossRanks.cpu().detach().numpy()
-        else:
-            if isinstance(tensorList, list):
-                tensorList = [t.cpu().detach().numpy() for t in tensorList]
-            latencyAcrossRanks = np.array(tensorList)
+        # use custom perf_loggers if specified and registered
+        if perf_metrics is not None and commsParams.use_perf_logger is not None:
+            for perfLoggerName in commsParams.use_perf_logger:
+                if perfLoggerName in customized_perf_loggers:
+                    customized_perf_loggers[perfLoggerName].logPerf(
+                        "comms",
+                        perf_metrics,
+                        self.backendFuncs,
+                    )
+                else:
+                    logger.info(
+                        f"Skipping logger '{perfLoggerName}' because it is not registered or implemented"
+                    )
 
+    def reportBenchTimeColl(
+        self, commsParams, results, tensorList, commUsElapsedList, computeUsElapsedList
+    ):
+        latencyAcrossRanks = self.backendFuncs.tensor_list_to_numpy(tensorList)
         logger.debug(f"Latency across all ranks: {latencyAcrossRanks}")
+
+        commLatencyAcrossRanks = self.backendFuncs.tensor_list_to_numpy(
+            commUsElapsedList
+        )
+        computeLatencyAcrossRanks = self.backendFuncs.tensor_list_to_numpy(
+            computeUsElapsedList
+        )
+        logger.debug(f"CommLatency across all ranks {commLatencyAcrossRanks}")
+        logger.debug(f"ComputeLatency across all ranks {computeLatencyAcrossRanks}")
 
         # Include only communicating ranks
         if self.collectiveArgs.collective == "multicast":
@@ -1123,25 +1263,52 @@ class commsCollBench(paramCommsBench):
         )
 
         m = commsParams.mm_dim
-        tflop = (2 * m * m * m) * self.collectiveArgs.numComputePerIter * 1e-12
+        tflop = (2 * m * m * m) * 1e-12
         secs = results["timeUS"] * 1e-6
-        tflops = tflop / secs
+        # use compute-only time to compute tflops in comms-compute mode
+        compute_p50 = 0.0
+        if computeLatencyAcrossRanks.size:
+            compute_p50 = np.percentile(computeLatencyAcrossRanks, 50)
+            tflops = tflop / compute_p50 * 1e6  # US to sec
+        else:
+            tflops = tflop * self.collectiveArgs.numComputePerIter / secs
+
+        # report comms-only time if comms-only time is captured;
+        # report original cpu time as total time
+        total_p50 = 0.0
+        if commLatencyAcrossRanks.size:
+            total_p50 = np.percentile(latencyAcrossCommRanks, 50)
+            latencyAcrossCommRanks = commLatencyAcrossRanks
+
+        # comms only time
         p50 = np.percentile(latencyAcrossCommRanks, 50)
         p75 = np.percentile(latencyAcrossCommRanks, 75)
         p95 = np.percentile(latencyAcrossCommRanks, 95)
         minlat = np.amin(latencyAcrossCommRanks)
         maxlat = np.amax(latencyAcrossCommRanks)
 
+        # adjust algBW/busBW based on final comms p50 latency
+        _, algBW = comms_utils.getAlgBW(p50 * 1e3, results["memSize"], 1)
+        busBW = self.backendFuncs.getBusBW(
+            self.collectiveArgs.collective,
+            algBW,
+            self.collectiveArgs,
+        )
+
         # adjust busBW
-        busBW = results["busBW"] * (commsParams.bitwidth / 32.0)
+        busBW *= commsParams.bitwidth / 32.0
 
         tflops_fmt = ""
         if commsParams.kernel == "gemm" and commsParams.mode != "comms":
             tflops_fmt = "{:>15}"
+        dev_time_fmt = ""
+        if commsParams.mode == "comms-compute":
+            dev_time_fmt = "{:>20}{:>20}"
 
         if not self.collectiveArgs.pair:
             fmt = (
                 "\tCOMMS-RES-{}-{}{}{:>18}{:>18}{:>18}{:>12}{:>12}{:>12}{:>12}{:>15}{:>12}"
+                + dev_time_fmt
                 + tflops_fmt
             )
             print(
@@ -1156,8 +1323,10 @@ class commsCollBench(paramCommsBench):
                     str("%.1f" % (p95)),
                     str("%.1f" % (minlat)),
                     str("%.1f" % (maxlat)),
-                    str("%.3f" % (results["algBW"])),
+                    str("%.3f" % (algBW)),
                     str("%.3f" % (busBW)),
+                    str("%.1f" % (total_p50)),
+                    str("%.1f" % (compute_p50)),
                     str("%.5f" % (tflops)),
                 )
             )
@@ -1169,6 +1338,7 @@ class commsCollBench(paramCommsBench):
                 )
             fmt = (
                 "\tCOMMS-RES-{}-{}{}{:>18}{:>18}{:>22}{:>18}{:>12}{:>12}{:>12}{:>12}{:>15}{:>12}"
+                + dev_time_fmt
                 + tflops_fmt
             )
             print(
@@ -1184,11 +1354,33 @@ class commsCollBench(paramCommsBench):
                     str("%.1f" % (p95)),
                     str("%.1f" % (minlat)),
                     str("%.1f" % (maxlat)),
-                    str("%.3f" % (results["algBW"])),
+                    str("%.3f" % (algBW)),
                     str("%.3f" % (busBW)),
+                    str("%.1f" % (total_p50)),
+                    str("%.1f" % (compute_p50)),
                     str("%.5f" % (tflops)),
                 )
             )
+
+        return commsCollPerfMetrics(
+            self.collectiveArgs.collective,
+            self.collectiveArgs.data_type,
+            benchType.Collective,
+            commsParams.backend,
+            self.tag,
+            results["memSize"],
+            results["memSize"],
+            results["numElements"],
+            results["numElements_pair"] if "numElements_pair" in results else 0,
+            float(p50),
+            float(p75),
+            float(p95),
+            float(minlat),
+            float(maxlat),
+            algBW,
+            busBW,
+            tflops,
+        )
 
     def reportBenchTimePt2Pt(self, commsParams, resultsAcrossRanks, results):
         pingLatencyAcrossRanks = []
@@ -1263,6 +1455,25 @@ class commsCollBench(paramCommsBench):
             )
         )
 
+        return commsPt2PtPerfMetrics(
+            self.collectiveArgs.collective,
+            self.collectiveArgs.data_type,
+            benchType.Collective,
+            commsParams.backend,
+            self.tag,
+            results["memSize"],
+            results["memSize"],
+            results["numElements"],
+            results["numElements_pair"] if "numElements_pair" in results else 0,
+            float(ping_p50),
+            float(ping_p75),
+            float(ping_p95),
+            float(avgUniBW),
+            float(avgBiBW),
+            float(totalUniBW),
+            float(totalBiBW),
+        )
+
     def benchTime(self, index, commsParams, backendFuncs):
         for coll in commsParams.collective_list:
             commsParams.collective = coll
@@ -1293,6 +1504,8 @@ class commsCollBench(paramCommsBench):
             numElements = int(curSize // commsParams.element_size)
             collectiveFunc = self.backendFuncs.noop
             collectiveFunc_pair = self.backendFuncs.noop
+            commUsElapsedList = []
+            computeUsElapsedList = []
 
             if (
                 commsParams.mode != "compute"
@@ -1307,6 +1520,7 @@ class commsCollBench(paramCommsBench):
                 commsArgs.worldSize = world_size
                 commsArgs.inSplit = commsParams.inSplit
                 commsArgs.outSplit = commsParams.outSplit
+                commsArgs.comms = commsParams.collective
 
                 (
                     self.collectiveArgs.ipTensor,
@@ -1340,6 +1554,7 @@ class commsCollBench(paramCommsBench):
                 commsArgs.inMsgSize = self.collectiveArgs.numElements_pair
                 commsArgs.outMsgSize = self.collectiveArgs.numElements_pair
                 commsArgs.worldSize = world_size
+                commsArgs.comms = commsParams.collective_pair
                 (
                     self.collectiveArgs.ipTensor_pair,
                     self.collectiveArgs.opTensor_pair,
@@ -1416,6 +1631,29 @@ class commsCollBench(paramCommsBench):
                     self.collectiveArgs, commsParams, dequantTimeElapsedList
                 )
 
+            # gather single compute and communication kernel time per iteration
+            if self.collectiveArgs.comm_dev_time:
+                results["commTimeUS"] = (
+                    self.collectiveArgs.comm_dev_time.getTimeUS()
+                    / self.collectiveArgs.numIters
+                    / self.collectiveArgs.numCollPerIter
+                )
+                commUsElapsedList.append(results["commTimeUS"])
+                commUsElapsedList = self.gatherBenchTime(
+                    self.collectiveArgs, commsParams, commUsElapsedList
+                )
+
+            if self.collectiveArgs.compute_dev_time:
+                results["computeTimeUS"] = (
+                    self.collectiveArgs.compute_dev_time.getTimeUS()
+                    / self.collectiveArgs.numIters
+                    / self.collectiveArgs.numComputePerIter
+                )
+                computeUsElapsedList.append(results["computeTimeUS"])
+                computeUsElapsedList = self.gatherBenchTime(
+                    self.collectiveArgs, commsParams, computeUsElapsedList
+                )
+
             # gather and report performance to stdout
             tensorList = self.gatherBenchTime(
                 self.collectiveArgs, commsParams, timeUsElapsedList
@@ -1427,6 +1665,8 @@ class commsCollBench(paramCommsBench):
                     tensorList,
                     quantTimeElapsedList,
                     dequantTimeElapsedList,
+                    commUsElapsedList,
+                    computeUsElapsedList,
                 )
 
             self.backendFuncs.sync_barrier(
@@ -1446,11 +1686,13 @@ class commsCollBench(paramCommsBench):
             commsParams.nw_stack == "pytorch-dist"
             and commsParams.backend in supportedC10dBackends
         ):
-            from pytorch_dist_backend import PyTorchDistBackend
+            from param_bench.train.comms.pt.pytorch_dist_backend import (
+                PyTorchDistBackend,
+            )
 
             backendObj = PyTorchDistBackend(bootstrap_info, commsParams)
         elif commsParams.nw_stack == "pytorch-xla-tpu":
-            from pytorch_tpu_backend import PyTorchTPUBackend
+            from param_bench.train.comms.pt.pytorch_tpu_backend import PyTorchTPUBackend
 
             backendObj = PyTorchTPUBackend(bootstrap_info, commsParams)
         else:
@@ -1459,7 +1701,9 @@ class commsCollBench(paramCommsBench):
                 logging.warning(
                     f"Attempt loading customized backend {commsParams.backend} if registered. Note that this is not officially supported. Use it with caution and at your own risk."
                 )
-                from pytorch_backend_utils import customized_backend
+                from param_bench.train.comms.pt.pytorch_backend_utils import (
+                    customized_backend,
+                )
 
                 backendObj = customized_backend[commsParams.backend](
                     bootstrap_info, commsParams
@@ -1530,7 +1774,7 @@ def main():
     collBenchObj.syncCommBenchDataTypes(args)
 
     for data_type in args.data_types:
-        args.data_type = data_type
+        args.data_type = data_type.lower()
 
         collBenchObj.checkArgs(args)
         element_size = torch.ones([1], dtype=args.dtype).element_size()
