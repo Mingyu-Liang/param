@@ -12,11 +12,18 @@ import numpy as np
 import torch
 import torch.distributed as dist
 import torch.nn as nn
-from param_profile import paramProfile
-from pytorch_backend_utils import backendFunctions, collectiveArgsHolder
+from param_bench.train.comms.pt.param_profile import paramProfile
+from param_bench.train.comms.pt.pytorch_backend_utils import (
+    backendFunctions,
+    collectiveArgsHolder,
+)
 
 try:
-    from internals import all_to_all_internal, all_to_allv_internal, extend_distributed
+    from param_bench.train.comms.pt.fb.internals import (
+        all_to_all_internal,
+        all_to_allv_internal,
+        extend_distributed,
+    )
 
     has_ext_dist = True
 except ImportError:
@@ -355,17 +362,24 @@ class PyTorchDistBackend(backendFunctions):
             return retObj
 
     def reduce_scatter(self, collectiveArgs, retFlag=False, pair=False):
+        if pair:
+            ipTensor = collectiveArgs.ipTensor_pair
+            opTensor = collectiveArgs.opTensor_pair
+        else:
+            ipTensor = collectiveArgs.ipTensor
+            opTensor = collectiveArgs.opTensor
+
         if self.use_ext_dist:
             retObj = collectiveArgs.group.reduce_scatter(
-                output=collectiveArgs.opTensor,
-                input_list=collectiveArgs.ipTensor,
+                output=opTensor,
+                input_list=ipTensor,
                 op=collectiveArgs.op,
                 async_op=collectiveArgs.asyncOp,
             )  # synchronicity is maintained in runColl
         else:
             retObj = dist.reduce_scatter(
-                output=collectiveArgs.opTensor,
-                input_list=collectiveArgs.ipTensor,
+                output=opTensor,
+                input_list=ipTensor,
                 op=collectiveArgs.op,
                 group=collectiveArgs.group,
                 async_op=collectiveArgs.asyncOp,
@@ -378,9 +392,16 @@ class PyTorchDistBackend(backendFunctions):
             return retObj
 
     def reduce_scatter_base(self, collectiveArgs, retFlag=False, pair=False):
+        if pair:
+            ipTensor = collectiveArgs.ipTensor_pair
+            opTensor = collectiveArgs.opTensor_pair
+        else:
+            ipTensor = collectiveArgs.ipTensor
+            opTensor = collectiveArgs.opTensor
+
         retObj = dist.reduce_scatter_tensor(
-            output=collectiveArgs.opTensor,
-            input=collectiveArgs.ipTensor,
+            output=opTensor,
+            input=ipTensor,
             op=collectiveArgs.op,
             group=self.get_collective_group(collectiveArgs),
             async_op=collectiveArgs.asyncOp,
@@ -393,9 +414,16 @@ class PyTorchDistBackend(backendFunctions):
             return retObj
 
     def all_gather_base(self, collectiveArgs, retFlag=False, pair=False):
+        if pair:
+            ipTensor = collectiveArgs.ipTensor_pair
+            opTensor = collectiveArgs.opTensor_pair
+        else:
+            ipTensor = collectiveArgs.ipTensor
+            opTensor = collectiveArgs.opTensor
+
         retObj = dist.all_gather_into_tensor(
-            output_tensor=collectiveArgs.opTensor,
-            input_tensor=collectiveArgs.ipTensor,
+            output_tensor=opTensor,
+            input_tensor=ipTensor,
             group=self.get_collective_group(collectiveArgs),
             async_op=collectiveArgs.asyncOp,
         )  # synchronicity is maintained in runColl
@@ -502,6 +530,30 @@ class PyTorchDistBackend(backendFunctions):
         if retFlag:
             return retObj
 
+    def P2POp(self, opType, collectiveArgs, peer, tag=0):
+        if opType == "send":
+            op = dist.isend
+            tensor = collectiveArgs.ipTensor
+        elif opType == "recv":
+            op = dist.irecv
+            tensor = collectiveArgs.opTensor
+        else:
+            raise RuntimeError(f"Unknown operation type {opType}")
+
+        return dist.P2POp(
+            op=op,
+            tensor=tensor,
+            peer=peer,
+            group=self.get_collective_group(collectiveArgs),
+            tag=tag,
+        )
+
+    def batch_isend_irecv(self, ops, collectiveArgs):
+        reqs = dist.batch_isend_irecv(ops)
+
+        for req in reqs:
+            collectiveArgs.waitObj.append(req)
+
     def device_sync(self, collectiveArgs):
         dev_str = (
             self.commsParams["device"]
@@ -596,6 +648,25 @@ class PyTorchDistBackend(backendFunctions):
         # Matrix multiplication as compute kernel
         collectiveArgs.MMout = torch.mm(collectiveArgs.MMin1, collectiveArgs.MMin2)
 
+    def add(self, collectiveArgs):
+        collectiveArgs.compOut = torch.add(
+            collectiveArgs.compIn1, collectiveArgs.compIn2, alpha=2
+        )
+
+    def sub(self, collectiveArgs):
+        collectiveArgs.compOut = torch.sub(
+            collectiveArgs.compIn1, collectiveArgs.compIn2, alpha=2
+        )
+
+    def add_num(self, collectiveArgs):
+        collectiveArgs.compOut = torch.add(collectiveArgs.compIn1, 20)
+
+    def sub_num(self, collectiveArgs):
+        collectiveArgs.compOut = torch.add(collectiveArgs.compIn1, 20)
+
+    def copy(self, collectiveArgs):
+        collectiveArgs.compIn1.copy_(collectiveArgs.compOut)
+
     def emb_lookup(self, collectiveArgs):
         # If we are using the batched embedding lookup with alltoall, don't do the embedding
         # lookup here, but pool it with the alltoalls in the collective
@@ -666,7 +737,14 @@ class PyTorchDistBackend(backendFunctions):
     def alloc_random(
         self, sizeArr, curRankDevice="cuda", dtype=torch.float32, scaleFactor=1.0
     ):
-        if dtype in (torch.uint8, torch.int16, torch.int32, torch.long):
+        if dtype in (
+            torch.int8,
+            torch.uint8,
+            torch.short,
+            torch.int16,
+            torch.int32,
+            torch.long,
+        ):
             ipTensor = torch.randint(
                 low=0, high=10, size=tuple(sizeArr), device=curRankDevice, dtype=dtype
             )
@@ -708,6 +786,9 @@ class PyTorchDistBackend(backendFunctions):
     # Getting world-size and other information.
     def get_local_rank(self):
         return self.bootstrap_info.local_rank
+
+    def get_local_size(self):
+        return self.bootstrap_info.local_size
 
     def get_global_rank(self):
         return dist.get_rank()
@@ -790,6 +871,18 @@ class PyTorchDistBackend(backendFunctions):
         else:
             return None
 
+    def get_new_event(self, enable_timing=False):
+        if self.commsParams.device == "cuda":
+            return torch.cuda.Event(enable_timing)
+        else:
+            return None
+
+    def get_current_stream(self, device: Optional[torch.device]):
+        if self.commsParams.device == "cuda":
+            return torch.cuda.current_stream(device)
+        else:
+            return None
+
     def switch_stream(self, stream, device: Optional[torch.device]):
         """switch to a new stream and return the current stream"""
         if device is None:
@@ -839,6 +932,13 @@ class PyTorchDistBackend(backendFunctions):
             "pt2pt"
         ] = self.noop  # dummy entry to support pt2pt benchmark
 
+        self.computeFunc["emb_lookup"] = self.emb_lookup
+        self.computeFunc["add"] = self.add
+        self.computeFunc["sub"] = self.sub
+        self.computeFunc["add_num"] = self.add_num
+        self.computeFunc["sub_num"] = self.sub_num
+        self.computeFunc["copy"] = self.copy
+
         backend = (
             self.commsParams["backend"]
             if isinstance(self.commsParams, dict)
@@ -870,6 +970,11 @@ class PyTorchDistBackend(backendFunctions):
             )
         else:
             return dist.new_group(ranks=group_ranks, backend=backend)
+
+    def tensor_list_to_numpy(self, tensorList):
+        if isinstance(tensorList, list):
+            tensorList = [t.cpu().detach().numpy() for t in tensorList]
+        return np.array(tensorList)
 
     def initialize_tcpstore(self, master_ip, master_port):
         global_rank = self.bootstrap_info.global_rank
