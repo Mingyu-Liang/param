@@ -47,15 +47,6 @@ from param_bench.train.compute.python.tools.utility import trace_handler
 from param_bench.train.compute.python.workloads import pytorch as workloads_pytorch
 from torch.profiler import ExecutionTraceObserver
 
-import os
-import sys
-
-comms_package_path = os.path.abspath(__file__).split('/')[:-4] + ['comms', 'pt']
-sys.path.append('/'.join(comms_package_path))
-
-import comms_utils
-import commsTraceReplay
-
 logger = logging.getLogger(__name__)
 
 
@@ -592,12 +583,6 @@ class ExgrReplayManager:
                                 self.unchangeable_intermediate_tensors.add(replay_t_id)
                         else:
                             dtype, rng = TORCH_DTYPES_RNG[data_type[7:-1]]
-                            # if data_type == "Tensor(signed char)":
-                            #     dtype, rng = TORCH_DTYPES_RNG["signed char"]
-                            # else:
-                            #     dtype, rng = TORCH_DTYPES_RNG[
-                            #         data_type.lstrip("Tensor(").rstrip(")")
-                            #     ]
                             self.tensor_registry_permanent[replay_t_id] = rng(shape).to(
                                 dtype
                             )
