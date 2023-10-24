@@ -29,6 +29,7 @@ TORCH_DTYPES_RNG = {
     "unsigned char": (torch.int8, torch.ones),
     "c10::Half": (torch.half, torch.ones),
     "c10::BFloat16": (torch.bfloat16, torch.ones),
+    "short int": (torch.short, torch.ones),
 }
 
 TORCH_DTYPES_RNG_str = {
@@ -44,6 +45,7 @@ TORCH_DTYPES_RNG_str = {
     "unsigned char": ("torch.int8", "torch.ones"),
     "c10::Half": ("torch.half", "torch.ones"),
     "c10::BFloat16": ("torch.bfloat16", "torch.ones"),
+    "short int": ("torch.short", "torch.ones"),
 }
 
 TORCH_DTYPES_BYTES = {
@@ -59,6 +61,7 @@ TORCH_DTYPES_BYTES = {
     "unsigned char": 1,
     "c10::Half": 2,
     "c10::BFloat16": 2,
+    "short int": 2,
 }
 
 

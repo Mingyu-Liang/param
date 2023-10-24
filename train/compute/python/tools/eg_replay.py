@@ -589,12 +589,13 @@ class ExgrReplayManager:
                             if "fbgemm::split_embedding_codegen_lookup" in node.name:
                                 self.unchangeable_intermediate_tensors.add(replay_t_id)
                         else:
-                            if data_type == "Tensor(signed char)":
-                                dtype, rng = TORCH_DTYPES_RNG["signed char"]
-                            else:
-                                dtype, rng = TORCH_DTYPES_RNG[
-                                    data_type.lstrip("Tensor(").rstrip(")")
-                                ]
+                            dtype, rng = TORCH_DTYPES_RNG[data_type[7:-1]]
+                            # if data_type == "Tensor(signed char)":
+                            #     dtype, rng = TORCH_DTYPES_RNG["signed char"]
+                            # else:
+                            #     dtype, rng = TORCH_DTYPES_RNG[
+                            #         data_type.lstrip("Tensor(").rstrip(")")
+                            #     ]
                             self.tensor_registry_permanent[replay_t_id] = rng(shape).to(
                                 dtype
                             )
@@ -604,7 +605,7 @@ class ExgrReplayManager:
                                 self.cpu_tensor.add(replay_t_id)
                     except KeyError:
                         if data_type != "Tensor(nullptr (uninitialized))":
-                            logger.error("KeyError: ", node.id, t_id, data_type)
+                            logger.error(f"KeyError: node id:{node.id}, t_id:{t_id}, data type:{data_type}")
                         self.tensor_registry_permanent[replay_t_id] = None
 
             ######
@@ -1333,6 +1334,7 @@ class ExgrReplayManager:
     def benchTime(self):
         start_time = datetime.now()
         self.preprocess_graph()
+
         if self.generator:
             return
         logger.info("Start execution: ")

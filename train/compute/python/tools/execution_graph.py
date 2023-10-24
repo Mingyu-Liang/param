@@ -240,15 +240,21 @@ class Node:
         return None
 
     def detect_type(self, name: str, inputs: List[Any], outputs: List[Any]) -> NodeType:
-        if (
-            any(name.startswith(x) for x in LABEL_MARKERS)
-            # and not outputs
-        ):
-            # if outputs:
-            #     print(f"{name} has outputs, not expected.")
-            return NodeType.LABEL
-        else:
+        # For comms ops, record_param_comms is the op to replay
+        if (self.op_schema and not name.startswith("c10d")) or name == "record_param_comms":
             return NodeType.OPERATOR
+        else:
+            return NodeType.LABEL
+
+        # if (
+        #     any(name.startswith(x) for x in LABEL_MARKERS)
+        #     # and not outputs
+        # ):
+        #     # if outputs:
+        #     #     print(f"{name} has outputs, not expected.")
+        #     return NodeType.LABEL
+        # else:
+        #     return NodeType.OPERATOR
 
     def get_tensors(self, param_list: Iterable) -> List[tuple]:
         tensors = []
