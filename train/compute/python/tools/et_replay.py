@@ -62,6 +62,7 @@ class ExgrReplayManager:
         self.cuda_id = 0
         self.debug = False
         self.compute_only = False
+        self.comms_only = False
         self.generator = False
         self.trace_file = ""
         self.dump = False
@@ -203,6 +204,7 @@ class ExgrReplayManager:
         self.cuda_id = self.args.cuda
         self.debug = self.args.debug
         self.compute_only = self.args.compute
+        self.comms_only = self.args.comms
         self.generator = self.args.generator
         self.dump = self.args.dump
         self.dump_path = self.args.dump_path
@@ -1115,6 +1117,9 @@ class ExgrReplayManager:
                     ] = op_tensor
             return
 
+        if self.comms_only:
+            return
+
         if self.debug and iter >= self.numWarmupIters:
             start_ns = time.time_ns()
 
@@ -1315,8 +1320,9 @@ class ExgrReplayManager:
         if self.generator:
             self.generate_code()
         else:
-            self.allocate_tensors()
-            self.reset_registry()
+            if not self.comms_only:
+                self.allocate_tensors()
+                self.reset_registry()
 
     def benchTime(self):
         start_time = datetime.now()
@@ -1557,6 +1563,12 @@ class ExgrReplayManager:
             action="store_true",
             default=False,
             help="Replay compute only.",
+        )
+        parser.add_argument(
+            "--comms",
+            action="store_true",
+            default=False,
+            help="Replay comms only.",
         )
         parser.add_argument(
             "--subgraph",

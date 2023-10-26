@@ -189,7 +189,7 @@ def _getTensorInfoFromPyTorchETEntry(
     elif list_count == 1:
         # GenericList[Tensor()]
         tensors = tensor_container[0]
-        dtype = container_type.replace("GenericList[", "").replace("]", "")
+        dtype = container_type.replace("GenericList[", "").replace("]", "").split(",", 1)[0]
     else:
         tensors.append(tensor_container[0])
         dtype = container_type
@@ -246,6 +246,9 @@ def _parseExecutionTrace(in_trace: ExecutionTrace, total_ranks: int) -> List:
             backendId = node.inputs[
                 2 - shift
             ]  # 3rd value of inputs is the backend id of the collective
+            
+            newComm.id = node.id
+
             if backendId in backendIdToGlobalRanks:
                 # Assign pg_id info for PGs that were created.
                 newComm.pgId = backendIdToPgid[backendId]
